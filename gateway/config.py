@@ -1002,6 +1002,32 @@ def load_gateway_config() -> GatewayConfig:
                     if isinstance(frc, list):
                         frc = ",".join(str(v) for v in frc)
                     os.environ["TELEGRAM_FREE_RESPONSE_CHATS"] = str(frc)
+                frt = telegram_cfg.get("free_response_topics")
+                if frt is not None:
+                    if not os.getenv("TELEGRAM_FREE_RESPONSE_TOPICS"):
+                        if isinstance(frt, list):
+                            serialized_topics = []
+                            for entry in frt:
+                                if isinstance(entry, dict):
+                                    chat_id = str(entry.get("chat_id", "")).strip()
+                                    thread_id = str(entry.get("thread_id", entry.get("topic_id", ""))).strip()
+                                    if chat_id and thread_id:
+                                        serialized_topics.append(f"{chat_id}:{thread_id}")
+                                elif str(entry).strip():
+                                    serialized_topics.append(str(entry).strip())
+                            frt_env = ",".join(serialized_topics)
+                        else:
+                            frt_env = str(frt)
+                        os.environ["TELEGRAM_FREE_RESPONSE_TOPICS"] = frt_env
+                    plat_data = platforms_data.setdefault(Platform.TELEGRAM.value, {})
+                    if not isinstance(plat_data, dict):
+                        plat_data = {}
+                        platforms_data[Platform.TELEGRAM.value] = plat_data
+                    extra = plat_data.setdefault("extra", {})
+                    if not isinstance(extra, dict):
+                        extra = {}
+                        plat_data["extra"] = extra
+                    extra.setdefault("free_response_topics", frt)
                 # allowed_chats: if set, bot ONLY responds in these group chats (whitelist)
                 ac = telegram_cfg.get("allowed_chats")
                 if ac is not None and not os.getenv("TELEGRAM_ALLOWED_CHATS"):

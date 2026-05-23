@@ -159,6 +159,18 @@ current.
 
 ## Workflow Examples
 
+### Specialized local service searches
+
+For niche repair/service requests (e.g. unusual keyboard brands, boutique electronics, specialty workshops), `nearby` may miss the right answer because OSM categories are too broad. Use maps for location context, but verify candidates through official pages/search results before recommending them.
+
+Recommended output:
+
+1. Start with brand-specific search (`<brand> repair <city>`, local language) and then class-specific search (`mechanical keyboard repair Moscow`, `custom keyboard service`).
+2. Prefer official pages that explicitly mention the brand or service class; treat directory listings as leads, not proof.
+3. Verify contact details from the candidate's own site: address, phone/email/Telegram, working hours, and any limits (e.g. “only devices bought from us”).
+4. Rank as a short action list: best first stop, official/vendor support if warranty or original parts matter, then general repair backups.
+5. Include a short call/message script for the user to ask whether they handle the exact model/technology.
+
 **"Find Italian restaurants near the Colosseum":**
 1. `nearby --near "Colosseum Rome" --category restaurant --radius 500`
    — one command, auto-geocoded

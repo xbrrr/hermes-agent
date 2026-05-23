@@ -497,6 +497,17 @@ vault in Obsidian on your laptop/phone — changes appear within seconds.
 - **Handle contradictions explicitly** — don't silently overwrite. Note both claims with dates,
   mark in frontmatter, flag for user review.
 
+## Agentic Project Archivist Pattern
+
+When the user wants an agent to act as an archivist for a multi-agent project, chat workspace, or evolving operations system, use this skill as the local-first backbone: create a wiki with schema/index/log, ingest curated source-of-truth files, produce topic inventories, skill maps, runbook indexes, system maps, and decision/policy pages. Keep raw sources local and immutable, add provenance and confidence, and require explicit approval before broad private-log ingestion or any external/cloud upload. See `references/agentic-stack-archivist-mvp.md` for the concrete MVP structure, safety policy, and verification checklist.
+
+## Agentic Stack Archivist Reference
+
+When building or researching an Agentic Stack project archivist, also read
+`references/agentic-stack-archivist.md`. It captures the local-first wiki MVP,
+secret-safety rules, Perplex social/web research path, GitHub/X evidence pattern,
+and Mikhail's compact-report expectation for this class of work.
+
 ## Related Tools
 
 [llm-wiki-compiler](https://github.com/atomicmemory/llm-wiki-compiler) is a Node.js CLI that

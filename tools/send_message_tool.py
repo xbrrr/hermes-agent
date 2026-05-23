@@ -308,6 +308,19 @@ def _handle_send(args):
             except Exception:
                 pass
 
+        if isinstance(result, dict) and result.get("success"):
+            try:
+                if _maybe_log_agentic_stack_outbound_task(
+                    platform_name,
+                    chat_id,
+                    thread_id,
+                    cleaned_message,
+                    result,
+                ):
+                    result["agentic_stack_logged"] = True
+            except Exception:
+                logger.debug("Agentic Stack outbound task logging failed", exc_info=True)
+
         if isinstance(result, dict) and "error" in result:
             result["error"] = _sanitize_error_text(result["error"])
         return json.dumps(result)
@@ -378,6 +391,93 @@ def _describe_media_for_mirror(media_files):
             return "[Sent audio attachment]"
         return "[Sent document attachment]"
     return f"[Sent {len(media_files)} media attachments]"
+
+
+def _maybe_log_agentic_stack_outbound_task(
+    platform_name: str,
+    chat_id: str,
+    thread_id: str | None,
+    message: str,
+    result: dict,
+) -> bool:
+    """Append scoped Hermes -> Bud task sends to the local Agentic Stack event log.
+
+    This is intentionally narrow and best-effort. It only runs for the current
+    Agentic Stack Telegram ops topic by default and only for successful public
+    ``/task@iq5000_bot correlation_id=...`` sends. It never sends Telegram
+    messages and never changes routing/enforcement.
+    """
+    expected_chat_id = os.getenv("HERMES_AGENTIC_STACK_CHAT_ID", "-1003772186616")
+    expected_topic_id = os.getenv("HERMES_AGENTIC_STACK_TOPIC_ID", "1346")
+    expected_task = os.getenv("HERMES_AGENTIC_STACK_TASK_NEEDLE", "/task@iq5000_bot")
+    events_path = os.getenv(
+        "HERMES_AGENTIC_STACK_CHAT_EVENTS",
+        "/Users/xbr/.agentic-stack/chat-events.jsonl",
+    )
+
+    if platform_name != "telegram":
+        return False
+    if str(chat_id) != expected_chat_id or str(thread_id) != expected_topic_id:
+        return False
+    if not isinstance(message, str) or expected_task not in message:
+        return False
+    corr_match = re.search(r"\bcorrelation_id=([^\s]+)", message)
+    if not corr_match:
+        return False
+    message_id = result.get("message_id")
+    if not message_id:
+        return False
+
+    event_file = os.path.expanduser(events_path)
+    event_dir = os.path.dirname(event_file)
+    if event_dir and not os.path.isdir(event_dir):
+        return False
+
+    correlation_id = corr_match.group(1)
+    event = {
+        "chat_id": expected_chat_id,
+        "from_agent": "hermes",
+        "from_username": "@ceo5000_bot",
+        "message_id": str(message_id),
+        "platform": "telegram",
+        "raw_summary": {
+            "message_type": "text",
+            "privacy": "synthetic outbound event; exact public task text only",
+            "source": "hermes.telegram.outbound_task_logger",
+            "phase": "hermes_outbound_task_logger_v1",
+            "correlation_id": correlation_id,
+        },
+        "reply_to_agent": "user",
+        "reply_to_message_id": expected_topic_id,
+        "text": message,
+        "topic_id": expected_topic_id,
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+
+    if os.path.exists(event_file):
+        try:
+            with open(event_file, "r", encoding="utf-8") as handle:
+                for line in handle:
+                    if not line.strip():
+                        continue
+                    try:
+                        existing = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if (
+                        str(existing.get("chat_id")) == expected_chat_id
+                        and str(existing.get("topic_id")) == expected_topic_id
+                        and str(existing.get("message_id")) == str(message_id)
+                        and re.search(r"\bcorrelation_id=" + re.escape(correlation_id) + r"(?:\s|$)", str(existing.get("text", "")))
+                    ):
+                        return False
+        except OSError:
+            return False
+
+    with open(event_file, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(event, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+        handle.write("\n")
+    return True
 
 
 def _get_cron_auto_delivery_target():

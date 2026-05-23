@@ -96,8 +96,17 @@ COMMAND_REGISTRY: list[CommandDef] = [
                gateway_only=True),
     CommandDef("background", "Run a prompt in the background", "Session",
                aliases=("bg", "btw"), args_hint="<prompt>"),
-    CommandDef("agents", "Show active agents and running tasks", "Session",
-               aliases=("tasks",)),
+    CommandDef("agents", "Show active agents and running agent sessions", "Session"),
+    CommandDef("task", "Create an Agentic Stack TODO card", "Session",
+               gateway_only=True, args_hint="<text>"),
+    CommandDef("tasks", "Show Agentic Stack TODO cards", "Session",
+               gateway_only=True),
+    CommandDef("mine", "Show Agentic Stack TODO cards assigned to you", "Session",
+               gateway_only=True),
+    CommandDef("stale", "Show Agentic Stack TODO cards due for review", "Session",
+               gateway_only=True),
+    CommandDef("done", "Close an Agentic Stack TODO card", "Session",
+               gateway_only=True, args_hint="[task_id]"),
     CommandDef("queue", "Queue a prompt for the next turn (doesn't interrupt)", "Session",
                aliases=("q",), args_hint="<prompt>"),
     CommandDef("steer", "Inject a message after the next tool call without interrupting", "Session",
@@ -1004,11 +1013,16 @@ def slack_native_slashes() -> list[tuple[str, str, str]]:
             continue
         _add(cmd.name, cmd.description, cmd.args_hint or "")
 
-    # Second pass: aliases.
-    for cmd in COMMAND_REGISTRY:
+    # Second pass: aliases. Keep high-traffic short aliases ahead of lower-use
+    # aliases when Slack's 50-command cap forces a clamp.
+    alias_priority = {"btw": 0, "bg": 1, "reset": 2, "q": 3}
+    for cmd in sorted(
+        COMMAND_REGISTRY,
+        key=lambda c: min((alias_priority.get(a, 100) for a in c.aliases), default=100),
+    ):
         if not _is_gateway_available(cmd, overrides):
             continue
-        for alias in cmd.aliases:
+        for alias in sorted(cmd.aliases, key=lambda a: alias_priority.get(a, 100)):
             # Skip aliases that only differ from canonical by case/punctuation
             # normalization (already covered by _add dedup).
             _add(alias, f"Alias for /{cmd.name} — {cmd.description}", cmd.args_hint or "")

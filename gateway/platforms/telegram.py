@@ -11,9 +11,11 @@ import asyncio
 import json
 import logging
 import os
+import subprocess
 import tempfile
 import html as _html
 import re
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any
 
 logger = logging.getLogger(__name__)
@@ -2225,6 +2227,58 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.warning("[%s] send_slash_confirm failed: %s", self.name, e)
             return SendResult(success=False, error=str(e))
 
+    def _task_panel_markup(self, task_id: str):
+        from gateway import task_panel
+
+        return InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(label, callback_data=callback_data)
+                for label, callback_data in row
+            ]
+            for row in task_panel.button_rows(task_id)
+        ])
+
+    async def send_task_panel(
+        self,
+        chat_id: str,
+        text: str,
+        task_id: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send an Agentic Stack TODO card with inline controls."""
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+
+        try:
+            from gateway import task_panel
+
+            task = task_panel.get_task(task_id)
+            html_text = (
+                task_panel.render_card_html(task)
+                if task is not None
+                else _html.escape(text or "")
+            )
+            thread_id = self._metadata_thread_id(metadata)
+            reply_to_id = self._reply_to_message_id_for_send(None, metadata)
+            msg = await self._send_message_with_thread_fallback(
+                chat_id=int(chat_id),
+                text=html_text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=self._task_panel_markup(task_id),
+                reply_to_message_id=reply_to_id,
+                **self._thread_kwargs_for_send(
+                    chat_id,
+                    thread_id,
+                    metadata,
+                    reply_to_message_id=reply_to_id,
+                ),
+                **self._link_preview_kwargs(),
+            )
+            return SendResult(success=True, message_id=str(msg.message_id))
+        except Exception as e:
+            logger.warning("[%s] send_task_panel failed: %s", self.name, e)
+            return SendResult(success=False, error=str(e))
+
     async def send_clarify(
         self,
         chat_id: str,
@@ -2630,6 +2684,61 @@ class TelegramAdapter(BasePlatformAdapter):
             chat_id = str(query.message.chat_id) if query.message else None
             if chat_id:
                 await self._handle_model_picker_callback(query, data, chat_id)
+            return
+
+        # --- Agentic Stack TODO panel callbacks (tp:action:task_id) ---
+        if data.startswith("tp:"):
+            try:
+                from gateway import task_panel
+
+                parsed = task_panel.parse_callback_data(data)
+                if not parsed:
+                    await query.answer(text="Invalid task action.")
+                    return
+                action, task_id = parsed
+                task = await asyncio.to_thread(task_panel.get_task, task_id)
+                if task is None:
+                    await query.answer(text="Задача не найдена.")
+                    return
+                if not task_panel.task_matches_scope(
+                    task,
+                    chat_id=str(query_chat_id) if query_chat_id is not None else None,
+                    thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                ):
+                    await query.answer(text="⛔ Кнопка из другого чата/топика.")
+                    return
+                caller_id = str(getattr(query.from_user, "id", ""))
+                if not self._is_callback_user_authorized(
+                    caller_id,
+                    chat_id=query_chat_id,
+                    chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                    thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                    user_name=query_user_name,
+                ):
+                    await query.answer(text="⛔ Нет доступа к этой кнопке.")
+                    return
+                actor = (
+                    getattr(query.from_user, "full_name", None)
+                    or getattr(query.from_user, "first_name", None)
+                    or getattr(query.from_user, "username", None)
+                    or caller_id
+                )
+                response = await asyncio.to_thread(task_panel.apply_callback, action, task_id, actor=str(actor or ""))
+                await query.answer(text="Готово")
+                try:
+                    await query.edit_message_text(
+                        text=_html.escape(response.text[:3900]),
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=self._task_panel_markup(task_id) if response.show_keyboard else None,
+                    )
+                except Exception:
+                    pass
+            except Exception as exc:
+                logger.warning("[%s] task panel callback failed: %s", self.name, exc)
+                try:
+                    await query.answer(text="Ошибка TODO-кнопки.")
+                except Exception:
+                    pass
             return
 
         # --- Exec approval callbacks (ea:choice:id) ---
@@ -3766,6 +3875,42 @@ class TelegramAdapter(BasePlatformAdapter):
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
 
+    def _telegram_free_response_topics(self) -> set[tuple[str, str]]:
+        """Return chat/topic pairs that bypass group mention requirements.
+
+        Entries may be configured as:
+        - "<chat_id>:<thread_id>" strings
+        - {"chat_id": "...", "thread_id": "..."} dictionaries
+        - {"chat_id": "...", "topic_id": "..."} dictionaries
+
+        This keeps global ``require_mention`` enabled while allowing a single
+        Telegram forum topic to behave as a coordinator-only lane.
+        """
+        raw = self.config.extra.get("free_response_topics")
+        if raw is None:
+            raw = os.getenv("TELEGRAM_FREE_RESPONSE_TOPICS", "")
+
+        values = raw if isinstance(raw, list) else str(raw).split(",")
+        topics: set[tuple[str, str]] = set()
+        for value in values:
+            if isinstance(value, dict):
+                chat_id = str(value.get("chat_id", "")).strip()
+                thread_id = str(value.get("thread_id", value.get("topic_id", ""))).strip()
+            else:
+                text = str(value).strip()
+                if not text:
+                    continue
+                # Telegram supergroup IDs are negative, so split from the right.
+                if ":" not in text:
+                    logger.warning("[%s] Ignoring invalid Telegram free_response_topics entry: %r", self.name, value)
+                    continue
+                chat_id, thread_id = (part.strip() for part in text.rsplit(":", 1))
+            if chat_id and thread_id:
+                topics.add((chat_id, thread_id))
+            else:
+                logger.warning("[%s] Ignoring invalid Telegram free_response_topics entry: %r", self.name, value)
+        return topics
+
     def _telegram_allowed_chats(self) -> set[str]:
         """Return the whitelist of group/supergroup chat IDs the bot will respond in.
 
@@ -3983,6 +4128,8 @@ class TelegramAdapter(BasePlatformAdapter):
             return True
         if chat_id_str in self._telegram_free_response_chats():
             return True
+        if thread_id is not None and (chat_id_str, str(thread_id)) in self._telegram_free_response_topics():
+            return True
         if not self._telegram_require_mention():
             return True
         if self._is_reply_to_bot(message):
@@ -3993,6 +4140,156 @@ class TelegramAdapter(BasePlatformAdapter):
             return True
         return self._message_matches_mention_patterns(message)
 
+    def _agentic_stack_observe_message(self, message: Any, *, update_id: Optional[int] = None) -> Optional[dict[str, Any]]:
+        """Phase-1B passive observer for the Agentic Stack topic.
+
+        This is intentionally narrow and side-effect-light: it only appends a
+        privacy-conscious JSONL event for the single approved Telegram topic.
+        It never changes routing decisions or sends replies.
+        """
+        chat = getattr(message, "chat", None)
+        if chat is None or str(getattr(chat, "id", "")) != "-1003772186616":
+            return
+        topic_id = getattr(message, "message_thread_id", None)
+        if str(topic_id) != os.getenv("HERMES_AGENTIC_STACK_TOPIC_ID", "1346"):
+            return
+
+        def _username(user: Any) -> Optional[str]:
+            if not user:
+                return None
+            username = getattr(user, "username", None)
+            if username:
+                return f"@{username}"
+            full_name = getattr(user, "full_name", None)
+            return full_name or None
+
+        def _agent_for_username(username: Optional[str]) -> Optional[str]:
+            if not username:
+                return "unknown"
+            lowered = username.lower()
+            if lowered == "@ceo5000_bot":
+                return "hermes"
+            if lowered == "@iq5000_bot":
+                return "bud"
+            return "user"
+
+        from_username = _username(getattr(message, "from_user", None))
+        reply_to = getattr(message, "reply_to_message", None)
+        reply_username = _username(getattr(reply_to, "from_user", None)) if reply_to else None
+        text = getattr(message, "text", None) or getattr(message, "caption", None) or ""
+        event = {
+            "ts": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+            "platform": "telegram",
+            "chat_id": str(getattr(chat, "id", "")),
+            "topic_id": str(topic_id),
+            "message_id": str(getattr(message, "message_id", "")),
+            "from_username": from_username,
+            "from_agent": _agent_for_username(from_username),
+            "text": text,
+            "reply_to_message_id": str(getattr(reply_to, "message_id", "")) if reply_to else None,
+            "reply_to_agent": _agent_for_username(reply_username) if reply_to else None,
+            "raw_summary": {
+                "source": "hermes.telegram.phase1b_observer",
+                "update_id": update_id,
+                "message_type": "text" if getattr(message, "text", None) else "caption_or_other",
+                "privacy": "no raw Telegram payload; scoped chat/topic only",
+            },
+        }
+        try:
+            subprocess.run(
+                [
+                    sys.executable,
+                    "/Users/xbr/.agentic-stack/append_chat_event.py",
+                ],
+                input=json.dumps(event, ensure_ascii=False),
+                text=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+                check=False,
+            )
+        except Exception as exc:
+            logger.debug("[Telegram] Agentic Stack passive observer failed: %s", exc)
+
+        return self._agentic_stack_log_routing_decision(event)
+
+    def _agentic_stack_decision_for_event(self, event: dict[str, Any]) -> dict[str, Any]:
+        """Compute the current topic-scoped routing decision without side effects."""
+        text = event.get("text") or ""
+        reply_to_agent = event.get("reply_to_agent")
+        mentions = []
+        lowered = text.lower()
+        if "@ceo5000_bot" in lowered:
+            mentions.append("hermes")
+        if "@iq5000_bot" in lowered:
+            mentions.append("bud")
+
+        intended_agent = "hermes"
+        reason = "default_responder"
+        ambiguity = None
+        unique_mentions = set(mentions)
+        # Agentic Stack subject-topic routing invariant: an explicit bot mention
+        # is the user's strongest addressing signal and must override reply
+        # context. Reply-to-same-agent applies only when no explicit mention
+        # targets another known agent.
+        if len(unique_mentions) == 1:
+            intended_agent = mentions[0]
+            reason = "explicit_mention"
+        elif len(unique_mentions) > 1:
+            intended_agent = "hermes"
+            reason = "fallback_on_uncertain"
+            ambiguity = "multiple_known_agent_mentions"
+        elif reply_to_agent in {"hermes", "bud"}:
+            intended_agent = reply_to_agent
+            reason = "reply_to_known_agent"
+
+        return {
+            "ts": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+            "phase": "3-soft-enforced" if self._agentic_stack_soft_enforced() else "2-dry-run",
+            "platform": event.get("platform"),
+            "chat_id": event.get("chat_id"),
+            "topic_id": event.get("topic_id"),
+            "message_id": event.get("message_id"),
+            "from_agent": event.get("from_agent"),
+            "reply_to_agent": reply_to_agent,
+            "mentions": mentions,
+            "intended_agent": intended_agent,
+            "reason": reason,
+            "ambiguity": ambiguity,
+            "enforced": self._agentic_stack_soft_enforced() and intended_agent == "bud",
+        }
+
+    def _agentic_stack_soft_enforced(self) -> bool:
+        if os.getenv("AGENTIC_ROUTING_DISABLED") == "1":
+            return False
+        if _Path("/Users/xbr/.agentic-stack/AGENTIC_ROUTING_DISABLED").exists():
+            return False
+        try:
+            text = _Path("/Users/xbr/.agentic-stack/chats.yaml").read_text(encoding="utf-8")
+        except OSError:
+            return False
+        return 'mode: "soft_enforced"' in text or "mode: soft_enforced" in text
+
+    def _agentic_stack_should_suppress_hermes(self, decision: Optional[dict[str, Any]]) -> bool:
+        return bool(decision and decision.get("enforced") and decision.get("intended_agent") == "bud")
+
+    def _agentic_stack_log_routing_decision(self, event: dict[str, Any]) -> Optional[dict[str, Any]]:
+        """Phase-2 dry-run routing decision log for the scoped topic only."""
+        try:
+            expected_topic_id = os.getenv("HERMES_AGENTIC_STACK_TOPIC_ID", "1346")
+            if event.get("chat_id") != "-1003772186616" or event.get("topic_id") != expected_topic_id:
+                return None
+            decision = self._agentic_stack_decision_for_event(event)
+            path = _Path("/Users/xbr/.agentic-stack/routing-decisions.jsonl")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(decision, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+                handle.write("\n")
+            return decision
+        except Exception as exc:
+            logger.debug("[Telegram] Agentic Stack routing dry-run log failed: %s", exc)
+            return None
+
     async def _handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming text messages.
 
@@ -4001,6 +4298,14 @@ class TelegramAdapter(BasePlatformAdapter):
         them into a single MessageEvent before dispatching.
         """
         if not update.message or not update.message.text:
+            return
+        decision = self._agentic_stack_observe_message(update.message, update_id=update.update_id)
+        if self._agentic_stack_should_suppress_hermes(decision):
+            logger.info(
+                "[Telegram] Agentic Stack soft routing suppressed Hermes for message_id=%s intended_agent=bud reason=%s",
+                getattr(update.message, "message_id", None),
+                decision.get("reason") if decision else None,
+            )
             return
         if not self._should_process_message(update.message):
             return
@@ -4012,6 +4317,14 @@ class TelegramAdapter(BasePlatformAdapter):
     async def _handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming command messages."""
         if not update.message or not update.message.text:
+            return
+        decision = self._agentic_stack_observe_message(update.message, update_id=update.update_id)
+        if self._agentic_stack_should_suppress_hermes(decision):
+            logger.info(
+                "[Telegram] Agentic Stack soft routing suppressed Hermes command for message_id=%s intended_agent=bud reason=%s",
+                getattr(update.message, "message_id", None),
+                decision.get("reason") if decision else None,
+            )
             return
         if not self._should_process_message(update.message, is_command=True):
             return

@@ -103,17 +103,53 @@ Types: `feat`, `fix`, `refactor`, `docs`, `test`, `ci`, `chore`, `perf`
 
 ## 3. Pushing and Creating a PR
 
-### Push the Branch (same either way)
+### Push the Branch
+
+**If you have write access to the upstream repo:**
 
 ```bash
 git push -u origin HEAD
+```
+
+**If you DON'T have write access (403 forbidden on push):**
+
+Create a fork and push to it instead:
+
+```bash
+# Check if fork exists
+gh repo view $GITHUB_USER/$(basename $(git remote get-url origin) .git) &>/dev/null || \
+  gh repo fork --clone=false
+
+# Add fork as remote (if not already added)
+git remote add fork https://github.com/$GITHUB_USER/$(basename $(git remote get-url origin) .git) 2>/dev/null || true
+
+# Push to fork
+git push -u fork HEAD
+```
+
+**With curl (no gh):**
+
+```bash
+# Create fork via API
+curl -s -X POST \
+  -H "Authorization: token $GITHUB_TOKEN" \
+  https://api.github.com/repos/$OWNER/$REPO/forks
+
+# Add fork remote (replace YOUR_USER with your GitHub username)
+git remote add fork https://github.com/YOUR_USER/$REPO.git 2>/dev/null || true
+
+# Push to fork
+git push -u fork HEAD
 ```
 
 ### Create the PR
 
 **With gh:**
 
+If you pushed to a fork, use `--repo` and `--head` to specify the upstream repo and your fork's branch:
+
 ```bash
+# Standard (direct push to upstream)
 gh pr create \
   --title "feat: add JWT-based user authentication" \
   --body "## Summary
@@ -124,6 +160,14 @@ gh pr create \
 - [ ] Unit tests pass
 
 Closes #42"
+
+# From a fork (when you lack write access)
+gh pr create \
+  --repo $OWNER/$REPO \
+  --head $GITHUB_USER:$(git branch --show-current) \
+  --base main \
+  --title "feat: add JWT-based user authentication" \
+  --body "..."
 ```
 
 Options: `--draft`, `--reviewer user1,user2`, `--label "enhancement"`, `--base develop`
@@ -133,6 +177,10 @@ Options: `--draft`, `--reviewer user1,user2`, `--label "enhancement"`, `--base d
 ```bash
 BRANCH=$(git branch --show-current)
 
+# If you pushed to a fork, HEAD should be "your_username:branch_name"
+# If you pushed directly to upstream, HEAD is just "branch_name"
+HEAD_REF="$BRANCH"  # or "$GITHUB_USER:$BRANCH" if using a fork
+
 curl -s -X POST \
   -H "Authorization: token $GITHUB_TOKEN" \
   -H "Accept: application/vnd.github.v3+json" \
@@ -140,7 +188,7 @@ curl -s -X POST \
   -d "{
     \"title\": \"feat: add JWT-based user authentication\",
     \"body\": \"## Summary\nAdds login and register API endpoints.\n\nCloses #42\",
-    \"head\": \"$BRANCH\",
+    \"head\": \"$HEAD_REF\",
     \"base\": \"main\"
   }"
 ```

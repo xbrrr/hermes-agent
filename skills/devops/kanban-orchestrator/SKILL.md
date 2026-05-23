@@ -148,6 +148,22 @@ Tell them what you created in plain prose, naming the actual profiles you used:
 >
 > The dispatcher will pick up T1 and T2 now. T3 starts when both finish. You'll get a gateway ping when T4 completes. Use the dashboard or `hermes kanban tail <id>` to follow along.
 
+### Step 6 — Verify executor pickup when routing through chat
+
+When work is delegated through Telegram/chat rather than a native Kanban API call, **sent is not accepted**. After posting a task, verify that the executor actually saw and accepted it:
+
+1. Record the outbound message id and correlation id in the user-facing update.
+2. Watch for a public `ACK`, `started`, `BLOCKED`, or equivalent progress reply from the executor.
+3. If no ACK appears within the expected short window, send a public status-check with the same correlation id asking for one of: `ACK`, `BLOCKED`, or `NOT RECEIVED`.
+4. If still silent, use the setup's reliable fallback/escalation path rather than assuming the task is running.
+5. For manager-facing updates, report status in human terms: `accepted`, `not accepted yet`, `blocked`, `stale`, or `routing issue`; avoid dumping raw logs unless asked.
+6. After an executor accepts (`ACK`/`started`), do not assume it will finish: keep a periodic watchdog/checkpoint until done. If it goes stale, automatically ask why with the same correlation id, try safe unblocking/fixes yourself or through the executor, and involve the user only for real blockers (permissions, secrets, destructive restart, or scope-changing product decisions).
+7. When an executor says `ready-for-review`, verify before calling the work complete: inspect changed artifacts, separate unrelated dirty files from the delegated scope, run the canonical targeted tests, perform a user-facing smoke test in a sandbox/temp DB where possible, run whitespace/security sanity checks, and list rollout gates still requiring approval.
+
+See `references/delegated-chat-supervision.md` for the staleness watchdog, safe BLOCKED triage, and ready-for-review validation package for chat-delegated work.
+
+For Telegram-native task/TODO topic design or review, use `references/agentic-stack-telegram-todo-topic.md`: dedicated control topic, source/panel message anchors, scoped buttons, `/done` by reply, and rollout gates.
+
 ## Common patterns
 
 **Fan-out + fan-in (research → synthesize):** N research-style cards with no parents, one synthesis card with all of them as parents.

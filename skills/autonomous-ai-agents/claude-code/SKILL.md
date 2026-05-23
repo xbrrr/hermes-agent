@@ -26,6 +26,33 @@ Delegate coding tasks to [Claude Code](https://code.claude.com/docs/en/cli-refer
 - **Version check:** `claude --version` (requires v2.x+)
 - **Update:** `claude update` or `claude upgrade`
 
+### Claude Pro/Max onboarding via Hermes
+
+When the user buys a Claude subscription and asks Hermes to finish setup:
+1. Verify local prerequisites (`node`, `npm`; `tmux` only for interactive long sessions).
+2. Install Claude Code with `npm install -g @anthropic-ai/claude-code` if missing.
+3. Launch `claude` once and let the user complete browser OAuth with the subscribed Claude account.
+4. Verify with `claude auth status --text`, `claude doctor`, and `claude --version`.
+5. Start with a single safe print-mode test, not autonomous parallel sessions.
+
+Account-safety defaults for subscription-backed Claude Code:
+- one Claude Code task at a time at first;
+- no 24/7 autonomous loops on Pro;
+- no attempts to bypass usage limits;
+- avoid unstable VPN/proxy geography;
+- do not share one account across multiple people/servers;
+- prefer `--max-turns` and restricted `--allowedTools`;
+- avoid `--dangerously-skip-permissions` unless explicitly needed and understood.
+
+## Role in a Hermes Setup
+
+Claude Code should usually be positioned as a **specialized coding worker**, not as the default Hermes conversational backend. For users choosing between Claude via OpenRouter and Claude Code:
+
+- Use **Claude via OpenRouter / model provider config** for Hermes' main chat brain, Telegram coordination, planning, cron, and general reasoning.
+- Use **Claude Code CLI** for repository-heavy execution: implementing features, fixing failing tests, refactoring, code review, security review, and multi-step codebase work.
+- Hermes should remain the manager/coordinator: define the task, launch Claude Code with bounded permissions/budget/turns, inspect changed files and test results, then report the outcome.
+- For account safety and cost control, avoid uncontrolled parallel Claude Code sessions. Prefer `-p` print mode with `--max-turns`, `--max-budget-usd`, and restricted `--allowedTools` unless the user explicitly wants an interactive long-running coding session.
+
 ## Two Orchestration Modes
 
 Hermes interacts with Claude Code in two fundamentally different ways. Choose based on the task.

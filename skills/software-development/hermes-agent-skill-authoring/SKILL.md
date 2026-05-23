@@ -26,6 +26,21 @@ There are two places a SKILL.md can live:
 - You're committing a reusable workflow that should ship with hermes-agent
 - You're editing an existing skill under `/home/bb/hermes-agent/skills/` (use `patch` for small edits, `write_file` for rewrites; `skill_manage` still works for patch on in-repo skills, but not for `create`)
 
+## End-of-Session Skill Updates
+
+When reviewing a completed session for reusable learning, be active: most sessions with corrections, non-trivial debugging, workflow changes, or tool-usage discoveries should produce at least a small skill update. A no-op is only appropriate when the session was routine and produced no durable learning.
+
+Preference order:
+
+1. Patch a skill that was loaded or directly in play during the session.
+2. If none fits, patch an existing class-level umbrella skill rather than creating a narrow one-off skill.
+3. Add `references/`, `templates/`, or `scripts/` support files under the umbrella when the detail is session-specific, bulky, or directly reusable.
+4. Create a new skill only when no class-level umbrella exists.
+
+For user corrections about style, tone, format, verbosity, or workflow, update the relevant SKILL.md body, not only memory. Memory captures who the user is; skills capture how this class of task should be performed next time.
+
+Do not capture transient environment failures, stale artifact IDs, one-off task narratives, or negative claims like “tool X does not work.” Capture the durable fix or retry pattern under the appropriate setup/troubleshooting skill instead.
+
 ## Required Frontmatter
 
 Source of truth: `tools/skill_manager_tool.py::_validate_frontmatter`. Hard requirements:
@@ -60,6 +75,22 @@ metadata:
 - Description: ≤ 1024 chars (enforced).
 - Full SKILL.md: ≤ 100,000 chars (enforced as `MAX_SKILL_CONTENT_CHARS`, ~36k tokens).
 - Peer skills in `software-development/` sit at **8-14k chars**. Aim for that range. If you're pushing past 20k, split into `references/*.md` and reference them from SKILL.md.
+
+## Reviewing Existing or Imported Skills
+
+When asked to analyze a skill/playbook before adoption, do not only summarize content. Audit it as a runtime artifact:
+
+- Measure line/character count, frontmatter validity, and `description` length. A description over 1024 chars is a hard problem; over ~250 chars is usually a retrieval-quality smell.
+- Check whether the artifact is trying to be both article/workshop/reference pack and executable `SKILL.md`. If so, recommend a bundle: concise `SKILL.md` plus `references/`, `templates/`, and `scripts/`.
+- Compare the document's rules against itself. Flag self-violations such as a long SKILL.md that says skills should be short.
+- Separate portable/core SKILL.md requirements from local/vendor extensions. Do not present fields like `verified_at` or `covers` as universal unless the target runtime enforces them.
+- For empirical claims and URLs, classify evidence quality and link status when tools are available. Treat blocked/403/timeouts differently from dead links.
+- If embedded code is labeled production/reference implementation but contains placeholders (`pass`, fake endpoints, pseudocode), flag it as skeleton or require a working script under `scripts/`.
+- For Mikhail/Telegram, default to an ultra-concise verdict first. If he asks “shorter”, treat that as a correction to compress immediately, not as an invitation to explain the same content again.
+
+When the user approves adoption of an external skill/playbook, prefer the safe-adoption pattern in `references/safe-external-skill-adoption.md`: install a conservative runtime extraction, exclude unreviewed scripts/URLs/broad claims, verify secret-safety, and sync executor runtimes separately only when useful.
+
+See `references/skill-review-checklist.md` for a reusable audit checklist and output shape.
 
 ## Peer-Matched Structure
 

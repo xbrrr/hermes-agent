@@ -17,11 +17,12 @@ from gateway.config import Platform, PlatformConfig
 from gateway.platforms.telegram import TelegramAdapter
 
 
-def _make_adapter():
+def _make_adapter(extra=None):
     adapter = object.__new__(TelegramAdapter)
     adapter.platform = Platform.TELEGRAM
-    adapter.config = PlatformConfig(enabled=True, token="***", extra={})
+    adapter.config = PlatformConfig(enabled=True, token="***", extra=extra or {})
     adapter._bot = SimpleNamespace(id=999, username="hermes_bot")
+    adapter._mention_patterns = []
     return adapter
 
 
@@ -140,6 +141,40 @@ class TestSubstringFalsePositivesAreRejected:
         adapter = _make_adapter()
         msg = _message(caption="foo@hermes_bot.example")
         assert adapter._message_mentions_bot(msg) is False
+
+
+class TestTopicFreeResponseRouting:
+    """Topic-scoped free-response bypass keeps global require_mention enabled."""
+
+    def test_configured_topic_processes_untagged_message(self):
+        adapter = _make_adapter(extra={
+            "require_mention": True,
+            "allowed_chats": ["-1003772186616"],
+            "free_response_topics": [
+                {"chat_id": "-1003772186616", "thread_id": "1346"},
+            ],
+        })
+        msg = _message(text="untagged topic message")
+        msg.chat.id = -1003772186616
+        msg.chat.type = "supergroup"
+        msg.message_thread_id = 1346
+        assert adapter._should_process_message(msg) is True
+
+    def test_other_topic_still_requires_mention(self):
+        adapter = _make_adapter(extra={
+            "require_mention": True,
+            "allowed_chats": ["-1003772186616"],
+            "free_response_topics": ["-1003772186616:1346"],
+        })
+        msg = _message(text="untagged other topic message")
+        msg.chat.id = -1003772186616
+        msg.chat.type = "supergroup"
+        msg.message_thread_id = 642
+        assert adapter._should_process_message(msg) is False
+
+    def test_negative_chat_id_string_entry_parses_from_right(self):
+        adapter = _make_adapter(extra={"free_response_topics": ["-1003772186616:1346"]})
+        assert adapter._telegram_free_response_topics() == {("-1003772186616", "1346")}
 
 
 class TestEntityEdgeCases:

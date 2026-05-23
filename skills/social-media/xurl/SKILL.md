@@ -371,12 +371,13 @@ xurl --app staging /2/users/me             # one-off against staging
 ## Agent Workflow
 
 1. Verify prerequisites: `xurl --help` and `xurl auth status`.
-2. **Check default app has credentials.** Parse the `auth status` output. The default app is marked with `▸`. If the default app shows `oauth2: (none)` but another app has a valid oauth2 user, tell the user to run `xurl auth default <that-app>` to fix it. This is the most common setup mistake — the user added an app with a custom name but never set it as default, so xurl keeps trying the empty `default` profile.
-3. If auth is missing entirely, stop and direct the user to the "One-Time User Setup" section — do NOT attempt to register apps or pass secrets yourself.
-4. Start with a cheap read (`xurl whoami`, `xurl user @handle`, `xurl search ... -n 3`) to confirm reachability.
-5. Confirm the target post/user and the user's intent before any write action (post, reply, like, repost, DM, follow, block, delete).
-6. Use JSON output directly — every response is already structured.
-7. Never paste `~/.xurl` contents back into the conversation.
+2. **Confirm this is the official X CLI, not a name collision.** `xurl --help` should say “authenticated requests to the X API” and list commands like `post`, `search`, `auth`, `timeline`. If it says `xurls extracts urls from text`, PATH is resolving to the unrelated `xurls` utility. Quick fix: install/use the official npm package in an isolated path and invoke it by absolute path, e.g. `mkdir -p ~/.local/opt/xdev-xurl && cd ~/.local/opt/xdev-xurl && npm init -y && npm install @xdevplatform/xurl@latest && ./node_modules/.bin/xurl --help`. Do not stop at the collision; fix the path or use the absolute binary, then rerun the task.
+3. **Check default app has credentials.** Parse the `auth status` output. The default app is marked with `▸`. If the default app shows `oauth2: (none)` but another app has a valid oauth2 user, tell the user to run `xurl auth default <that-app>` to fix it. This is the most common setup mistake — the user added an app with a custom name but never set it as default, so xurl keeps trying the empty `default` profile.
+4. If auth is missing entirely, do not attempt to register apps or pass secrets yourself. For write actions, stop and direct the user to the "One-Time User Setup" section. For read-only research, use authenticated `xurl` if available; otherwise use non-Cloudflare paths such as Perplex/Sonar social search or search-index snippets, and clearly label the fallback. If the task explicitly requires open-ended X/social research, first verify the documented Perplex/Sonar helper and environment rather than producing a broad fallback report; fix the path/env or ask the executor to verify, then rerun.
+5. Start with a cheap read (`xurl whoami`, `xurl user @handle`, `xurl search ... -n 3`) to confirm reachability.
+6. Confirm the target post/user and the user's intent before any write action (post, reply, like, repost, DM, follow, block, delete).
+7. Use JSON output directly — every response is already structured.
+8. Never paste `~/.xurl` contents back into the conversation.
 
 ---
 
@@ -385,6 +386,7 @@ xurl --app staging /2/users/me             # one-off against staging
 | Symptom | Cause | Fix |
 | --- | --- | --- |
 | Auth errors after successful OAuth flow | Token saved to `default` app (no client-id/secret) instead of your named app | `xurl auth oauth2 --app my-app` then `xurl auth default my-app` |
+| `xurl --help` says `xurls extracts urls from text` | PATH resolves to the unrelated `xurls` URL-extractor binary, not X Developer Platform's `xurl` CLI | Install/use official CLI through npm or another method, e.g. `mkdir -p ~/.local/opt/xdev-xurl && cd ~/.local/opt/xdev-xurl && npm init -y && npm install @xdevplatform/xurl@latest`, then call `~/.local/opt/xdev-xurl/node_modules/.bin/xurl` or put that directory earlier in PATH. |
 | `unauthorized_client` during OAuth | App type set to "Native App" in X dashboard | Change to "Web app, automated app or bot" in User Authentication Settings |
 | `UsernameNotFound` or 403 on `/2/users/me` right after OAuth | X not returning username reliably from `/2/users/me` | Re-run `xurl auth oauth2 --app my-app YOUR_USERNAME` (xurl v1.1.0+) to pass the handle explicitly |
 | 401 on every request | Token expired or wrong default app | Check `xurl auth status` — verify `▸` points to an app with oauth2 tokens |

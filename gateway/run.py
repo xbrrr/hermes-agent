@@ -6162,6 +6162,11 @@ class GatewayRunner:
             if _cmd_def_inner and _cmd_def_inner.name == "kanban":
                 return await self._handle_kanban_command(event)
 
+            # Agentic Stack TODO commands are control-plane only and must stay
+            # usable while an agent is busy in the same topic.
+            if _cmd_def_inner and _cmd_def_inner.name in {"task", "tasks", "mine", "stale", "done"}:
+                return await self._handle_task_panel_command(event, _cmd_def_inner.name)
+
             # /goal is safe mid-run for status/pause/clear (inspection and
             # control-plane only — doesn't interrupt the running turn).
             # Setting a new goal text mid-run is rejected with the same
@@ -6482,6 +6487,9 @@ class GatewayRunner:
 
         if canonical == "kanban":
             return await self._handle_kanban_command(event)
+
+        if canonical in {"task", "tasks", "mine", "stale", "done"}:
+            return await self._handle_task_panel_command(event, canonical)
 
         if canonical == "retry":
             return await self._handle_retry_command(event)
@@ -8504,6 +8512,45 @@ class GatewayRunner:
         if len(output) > 3800:
             output = output[:3800] + "\n" + t("gateway.kanban.truncated_suffix")
         return output or t("gateway.kanban.no_output")
+
+    async def _handle_task_panel_command(self, event: MessageEvent, command: str) -> str | None:
+        """Handle Agentic Stack TODO panel commands.
+
+        The TODO panel is a lightweight Telegram-native index. It deliberately
+        bypasses the LLM loop and stores state in its own SQLite database.
+        """
+        from gateway import task_panel
+
+        response = await asyncio.to_thread(
+            task_panel.handle_command,
+            command,
+            event.get_command_args(),
+            source=event.source,
+            reply_to_message_id=event.reply_to_message_id or "",
+            reply_to_text=event.reply_to_text or "",
+            source_message_id=event.message_id or "",
+        )
+        adapter = self.adapters.get(event.source.platform) if event.source else None
+        if response.show_keyboard and response.task_id and hasattr(adapter, "send_task_panel"):
+            result = await adapter.send_task_panel(
+                event.source.chat_id,
+                response.text,
+                response.task_id,
+                metadata=_thread_metadata_for_source(event.source, _reply_anchor_for_event(event)),
+            )
+            if getattr(result, "success", False):
+                panel_message_id = str(getattr(result, "message_id", "") or "")
+                if panel_message_id:
+                    await asyncio.to_thread(
+                        task_panel.update_task,
+                        response.task_id,
+                        panel_message_id=panel_message_id,
+                        actor="system",
+                        event_action="panel_sent",
+                        event_detail=panel_message_id,
+                    )
+                return None
+        return response.text
 
     async def _handle_status_command(self, event: MessageEvent) -> str:
         """Handle /status command."""

@@ -107,7 +107,14 @@ class TestResolveCommand:
         assert resolve_command("gateway").name == "platforms"
         assert resolve_command("set-home").name == "sethome"
         assert resolve_command("reload_mcp").name == "reload-mcp"
-        assert resolve_command("tasks").name == "agents"
+        assert resolve_command("tasks").name == "tasks"
+
+    def test_task_panel_commands_are_gateway_commands(self):
+        for name in ("task", "tasks", "mine", "stale", "done"):
+            cmd = resolve_command(name)
+            assert cmd is not None
+            assert cmd.name == name
+            assert name in GATEWAY_KNOWN_COMMANDS
 
     def test_topic_is_gateway_command(self):
         topic = resolve_command("topic")

@@ -23,6 +23,7 @@ def _reset_signal_scheduler():
 from gateway.config import Platform
 from tools.send_message_tool import (
     _derive_forum_thread_name,
+    _maybe_log_agentic_stack_outbound_task,
     _parse_target_ref,
     _send_discord,
     _send_matrix_via_adapter,
@@ -78,6 +79,65 @@ def _ensure_slack_mock(monkeypatch):
 
 
 class TestSendMessageTool:
+    def test_agentic_stack_outbound_task_send_is_logged(self, monkeypatch, tmp_path):
+        events_path = tmp_path / "chat-events.jsonl"
+        monkeypatch.setenv("HERMES_AGENTIC_STACK_CHAT_EVENTS", str(events_path))
+        monkeypatch.delenv("HERMES_CRON_AUTO_DELIVER_PLATFORM", raising=False)
+        monkeypatch.delenv("HERMES_CRON_AUTO_DELIVER_CHAT_ID", raising=False)
+        monkeypatch.delenv("HERMES_CRON_AUTO_DELIVER_THREAD_ID", raising=False)
+        config, _telegram_cfg = _make_config()
+        message = "/task@iq5000_bot correlation_id=auto-log-test hops=0 max_hops=2"
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True, "message_id": "m-auto"})):
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "telegram:-1003772186616:1346",
+                        "message": message,
+                    }
+                )
+            )
+
+        assert result["success"] is True
+        assert result["agentic_stack_logged"] is True
+        rows = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
+        assert len(rows) == 1
+        assert rows[0]["from_agent"] == "hermes"
+        assert rows[0]["from_username"] == "@ceo5000_bot"
+        assert rows[0]["message_id"] == "m-auto"
+        assert rows[0]["topic_id"] == "1346"
+        assert rows[0]["raw_summary"]["source"] == "hermes.telegram.outbound_task_logger"
+        assert rows[0]["raw_summary"]["correlation_id"] == "auto-log-test"
+
+    def test_agentic_stack_outbound_task_logger_dedupes(self, monkeypatch, tmp_path):
+        events_path = tmp_path / "chat-events.jsonl"
+        monkeypatch.setenv("HERMES_AGENTIC_STACK_CHAT_EVENTS", str(events_path))
+        message = "/task@iq5000_bot correlation_id=dedupe-test hops=0 max_hops=2"
+        result = {"success": True, "message_id": "m-dedupe"}
+
+        assert _maybe_log_agentic_stack_outbound_task(
+            "telegram", "-1003772186616", "1346", message, result
+        ) is True
+        assert _maybe_log_agentic_stack_outbound_task(
+            "telegram", "-1003772186616", "1346", message, result
+        ) is False
+        assert len(events_path.read_text(encoding="utf-8").splitlines()) == 1
+
+    def test_agentic_stack_outbound_task_logger_ignores_non_scope(self, monkeypatch, tmp_path):
+        events_path = tmp_path / "chat-events.jsonl"
+        monkeypatch.setenv("HERMES_AGENTIC_STACK_CHAT_EVENTS", str(events_path))
+        message = "/task@iq5000_bot correlation_id=wrong-topic hops=0 max_hops=2"
+        result = {"success": True, "message_id": "m-wrong"}
+
+        assert _maybe_log_agentic_stack_outbound_task(
+            "telegram", "-1003772186616", "642", message, result
+        ) is False
+        assert not events_path.exists()
+
     def test_cron_duplicate_target_is_skipped_and_explained(self):
         home = SimpleNamespace(chat_id="-1001")
         config, _telegram_cfg = _make_config()
@@ -88,6 +148,7 @@ class TestSendMessageTool:
             {
                 "HERMES_CRON_AUTO_DELIVER_PLATFORM": "telegram",
                 "HERMES_CRON_AUTO_DELIVER_CHAT_ID": "-1001",
+                "HERMES_CRON_AUTO_DELIVER_THREAD_ID": "",
             },
             clear=False,
         ), \
@@ -2087,8 +2148,7 @@ class TestSendViaAdapterStandaloneFallback:
             standalone_sender_fn=send_fn,
         )
 
-    @pytest.mark.asyncio
-    async def test_standalone_sender_fn_called_when_no_adapter(self, monkeypatch):
+    def test_standalone_sender_fn_called_when_no_adapter(self, monkeypatch):
         """Registry has hook, runner ref returns None: the hook is awaited."""
         from tools.send_message_tool import _send_via_adapter
         from gateway.platform_registry import platform_registry
@@ -2107,12 +2167,12 @@ class TestSendViaAdapterStandaloneFallback:
             monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: None)
 
             pconfig = SimpleNamespace(extra={})
-            result = await _send_via_adapter(
+            result = _run_async_immediately(_send_via_adapter(
                 _FakePlatform("fakeplatform"),
                 pconfig,
                 "room/123",
                 "hello cron",
-            )
+            ))
         finally:
             platform_registry.unregister("fakeplatform")
 
@@ -2121,8 +2181,7 @@ class TestSendViaAdapterStandaloneFallback:
         assert recorded["message"] == "hello cron"
         assert recorded["pconfig"] is pconfig
 
-    @pytest.mark.asyncio
-    async def test_standalone_sender_fn_kwargs_forwarded(self, monkeypatch):
+    def test_standalone_sender_fn_kwargs_forwarded(self, monkeypatch):
         """thread_id, media_files, and force_document all reach the hook."""
         from tools.send_message_tool import _send_via_adapter
         from gateway.platform_registry import platform_registry
@@ -2140,7 +2199,7 @@ class TestSendViaAdapterStandaloneFallback:
         try:
             monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: None)
 
-            await _send_via_adapter(
+            _run_async_immediately(_send_via_adapter(
                 _FakePlatform("fakeplatform"),
                 SimpleNamespace(extra={}),
                 "chat-1",
@@ -2148,7 +2207,7 @@ class TestSendViaAdapterStandaloneFallback:
                 thread_id="thread-7",
                 media_files=["/tmp/a.png"],
                 force_document=True,
-            )
+            ))
         finally:
             platform_registry.unregister("fakeplatform")
 
@@ -2156,8 +2215,7 @@ class TestSendViaAdapterStandaloneFallback:
         assert recorded["media_files"] == ["/tmp/a.png"]
         assert recorded["force_document"] is True
 
-    @pytest.mark.asyncio
-    async def test_standalone_sender_fn_absent_returns_helpful_error(self, monkeypatch):
+    def test_standalone_sender_fn_absent_returns_helpful_error(self, monkeypatch):
         """Registry entry has no hook: the fall-through error explains both
         options (gateway-running and standalone hook)."""
         from tools.send_message_tool import _send_via_adapter
@@ -2167,12 +2225,12 @@ class TestSendViaAdapterStandaloneFallback:
         try:
             monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: None)
 
-            result = await _send_via_adapter(
+            result = _run_async_immediately(_send_via_adapter(
                 _FakePlatform("fakeplatform"),
                 SimpleNamespace(extra={}),
                 "chat-1",
                 "hi",
-            )
+            ))
         finally:
             platform_registry.unregister("fakeplatform")
 
@@ -2180,8 +2238,7 @@ class TestSendViaAdapterStandaloneFallback:
         assert "fakeplatform" in result["error"]
         assert "standalone_sender_fn" in result["error"]
 
-    @pytest.mark.asyncio
-    async def test_standalone_sender_fn_raises_is_caught_and_formatted(self, monkeypatch):
+    def test_standalone_sender_fn_raises_is_caught_and_formatted(self, monkeypatch):
         """Hook raises: error dict has 'Plugin standalone send failed: ...'"""
         from tools.send_message_tool import _send_via_adapter
         from gateway.platform_registry import platform_registry
@@ -2193,19 +2250,18 @@ class TestSendViaAdapterStandaloneFallback:
         try:
             monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: None)
 
-            result = await _send_via_adapter(
+            result = _run_async_immediately(_send_via_adapter(
                 _FakePlatform("fakeplatform"),
                 SimpleNamespace(extra={}),
                 "chat-1",
                 "hi",
-            )
+            ))
         finally:
             platform_registry.unregister("fakeplatform")
 
         assert result == {"error": "Plugin standalone send failed: boom!"}
 
-    @pytest.mark.asyncio
-    async def test_standalone_sender_fn_return_shape_passed_through(self, monkeypatch):
+    def test_standalone_sender_fn_return_shape_passed_through(self, monkeypatch):
         """Hook returns success dict: passed through unchanged."""
         from tools.send_message_tool import _send_via_adapter
         from gateway.platform_registry import platform_registry
@@ -2217,12 +2273,12 @@ class TestSendViaAdapterStandaloneFallback:
         try:
             monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: None)
 
-            result = await _send_via_adapter(
+            result = _run_async_immediately(_send_via_adapter(
                 _FakePlatform("fakeplatform"),
                 SimpleNamespace(extra={}),
                 "chat-1",
                 "hi",
-            )
+            ))
         finally:
             platform_registry.unregister("fakeplatform")
 
