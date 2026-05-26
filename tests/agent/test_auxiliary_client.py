@@ -2865,6 +2865,25 @@ class TestAnthropicExplicitApiKey:
             "resolve_provider_client must forward explicit_api_key to _try_anthropic()"
         )
 
+    def test_resolve_provider_client_passes_model_to_anthropic(self):
+        """Anthropic auxiliary resolution must honor auxiliary.<task>.model.
+
+        Regression: the Anthropic branch built the client with the hardcoded
+        cheap default (Haiku) even when callers supplied a configured model
+        such as Sonnet for compression. Runtime policy can forbid Haiku, so
+        the provider was incorrectly reported unavailable.
+        """
+        with patch("agent.anthropic_adapter.resolve_anthropic_token", return_value="env-key"), \
+             patch("agent.anthropic_adapter.build_anthropic_client") as mock_build, \
+             patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)):
+            mock_build.return_value = MagicMock()
+            client, model = resolve_provider_client(
+                provider="anthropic",
+                model="claude-sonnet-4-5-20250929",
+            )
+        assert client is not None
+        assert model == "claude-sonnet-4-5-20250929"
+
 
 # ── Auxiliary unhealthy-provider TTL cache (issue #23570) ────────────────
 

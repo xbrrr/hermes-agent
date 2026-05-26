@@ -504,6 +504,17 @@ DEFAULT_CONFIG = {
     "model": "",
     "providers": {},
     "fallback_providers": [],
+    "runtime_model_monitor": {
+        "enabled": False,
+        "probe_interval_seconds": 300,
+        "probe_timeout_seconds": 20,
+        "notify_cooldown_seconds": 900,
+        "target": {
+            "platform": "telegram",
+            "chat_id": "",
+            "thread_id": "",
+        },
+    },
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
     "agent": {

@@ -39,6 +39,7 @@ from agent.message_sanitization import (
     _repair_tool_call_arguments,
     _sanitize_surrogates,
 )
+from agent.model_runtime_monitor import can_restore_primary_runtime
 from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_result_message
 from agent.trajectory import convert_scratchpad_to_think
 from agent.error_classifier import classify_api_error, FailoverReason
@@ -860,6 +861,9 @@ def restore_primary_runtime(agent) -> bool:
         # entirely, stranding the index and silently blocking all future
         # fallback attempts for the session.  Fixes #20465.
         agent._fallback_index = 0
+        return False
+
+    if not can_restore_primary_runtime(agent):
         return False
 
     if getattr(agent, "_rate_limited_until", 0) > time.monotonic():

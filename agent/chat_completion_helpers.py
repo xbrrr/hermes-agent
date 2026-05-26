@@ -35,6 +35,7 @@ from urllib.parse import urlparse, parse_qs, urlunparse
 
 from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale_timeout
 from agent.error_classifier import classify_api_error, FailoverReason
+from agent.model_runtime_monitor import before_llm_call, on_fallback_activated
 from agent.model_metadata import is_local_endpoint
 from agent.message_sanitization import (
     _sanitize_surrogates,
@@ -90,6 +91,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
     the main retry loop can try again with backoff / credential rotation /
     provider fallback.
     """
+    before_llm_call(agent, call_site="interruptible_api_call")
     result = {"response": None, "error": None}
     request_client_holder = {"client": None, "owner_tid": None}
     request_client_lock = threading.Lock()
@@ -717,7 +719,11 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
 
 
 
-def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool:
+def try_activate_fallback(
+    agent,
+    reason: "FailoverReason | None" = None,
+    reason_detail: str | None = None,
+) -> bool:
     """Switch to the next fallback model/provider in the chain.
 
     Called when the current model is failing after retries.  Swaps the
@@ -843,6 +849,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             fb_api_mode = "bedrock_converse"
 
         old_model = agent.model
+        old_provider = getattr(agent, "provider", "") or ""
 
         # Clear the per-config context_length override so the fallback
         # model's actual context window is resolved instead of inheriting
@@ -949,6 +956,15 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         logging.info(
             "Fallback activated: %s → %s (%s)",
             old_model, fb_model, fb_provider,
+        )
+        on_fallback_activated(
+            agent,
+            reason=reason,
+            reason_detail=reason_detail,
+            from_provider=old_provider,
+            from_model=old_model,
+            to_provider=fb_provider,
+            to_model=fb_model,
         )
         return True
     except Exception as e:
@@ -1223,6 +1239,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     Falls back to _interruptible_api_call on provider errors indicating
     streaming is not supported.
     """
+    before_llm_call(agent, call_site="interruptible_streaming_api_call")
     if agent._interrupt_requested:
         raise InterruptedError("Agent interrupted before streaming API call")
 

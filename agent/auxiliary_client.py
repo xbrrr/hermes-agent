@@ -2023,7 +2023,10 @@ def _try_azure_foundry(
     return client, final_model
 
 
-def _try_anthropic(explicit_api_key: str = None) -> Tuple[Optional[Any], Optional[str]]:
+def _try_anthropic(
+    explicit_api_key: str = None,
+    model: Optional[str] = None,
+) -> Tuple[Optional[Any], Optional[str]]:
     try:
         from agent.anthropic_adapter import build_anthropic_client, resolve_anthropic_token
     except ImportError:
@@ -2059,7 +2062,14 @@ def _try_anthropic(explicit_api_key: str = None) -> Tuple[Optional[Any], Optiona
 
     from agent.anthropic_adapter import _is_oauth_token
     is_oauth = _is_oauth_token(token)
-    model = _get_aux_model_for_provider("anthropic") or "claude-haiku-4-5-20251001"
+    model = model or _get_aux_model_for_provider("anthropic") or "claude-haiku-4-5-20251001"
+    try:
+        from agent.model_policy import reject_forbidden_model
+
+        if reject_forbidden_model(model, usage="anthropic auxiliary fallback"):
+            return None, None
+    except Exception:
+        pass
     logger.debug("Auxiliary client: Anthropic native (%s) at %s (oauth=%s)", model, base_url, is_oauth)
     try:
         real_client = build_anthropic_client(token, base_url)
@@ -2927,6 +2937,22 @@ def _resolve_auto(main_runtime: Optional[Dict[str, Any]] = None) -> Tuple[Option
     # config.yaml (auxiliary.<task>.provider) still win over this.
     main_provider = str(runtime_provider or _read_main_provider() or "")
     main_model = str(runtime_model or _read_main_model() or "")
+    if main_provider and main_model:
+        try:
+            from agent.model_policy import reject_forbidden_model, reject_forbidden_provider
+
+            if reject_forbidden_provider(
+                main_provider,
+                usage=f"auxiliary main provider {main_provider}",
+            ):
+                main_model = ""
+            if reject_forbidden_model(
+                main_model,
+                usage=f"auxiliary main provider {main_provider}",
+            ):
+                main_model = ""
+        except Exception:
+            pass
     if (main_provider and main_model
             and main_provider not in {"auto", ""}):
         resolved_provider = main_provider
@@ -2960,6 +2986,14 @@ def _resolve_auto(main_runtime: Optional[Dict[str, Any]] = None) -> Tuple[Option
     # ── Step 2: aggregator / fallback chain ──────────────────────────────
     tried = []
     for label, try_fn in _get_provider_chain():
+        try:
+            from agent.model_policy import reject_forbidden_provider
+
+            if reject_forbidden_provider(label, usage="auxiliary auto fallback"):
+                tried.append(f"{label} (policy)")
+                continue
+        except Exception:
+            pass
         if _is_provider_unhealthy(label):
             _log_skip_unhealthy(label)
             tried.append(f"{label} (unhealthy)")
@@ -3115,6 +3149,18 @@ def resolve_provider_client(
     original_provider = (provider or "").strip().lower()
     # Normalise aliases
     provider = _normalize_aux_provider(provider)
+    try:
+        from agent.model_policy import reject_forbidden_model, reject_forbidden_provider
+
+        if provider not in {"auto", ""} and reject_forbidden_provider(
+            provider,
+            usage="auxiliary provider",
+        ):
+            return None, None
+        if model and reject_forbidden_model(model, usage=f"auxiliary provider {provider}"):
+            return None, None
+    except Exception:
+        pass
 
     def _needs_codex_wrap(client_obj, base_url_str: str, model_str: str) -> bool:
         """Decide if a plain OpenAI client should be wrapped for Responses API.
@@ -3488,7 +3534,10 @@ def resolve_provider_client(
 
     if pconfig.auth_type == "api_key":
         if provider == "anthropic":
-            client, default_model = _try_anthropic(explicit_api_key=explicit_api_key)
+            client, default_model = _try_anthropic(
+                explicit_api_key=explicit_api_key,
+                model=model,
+            )
             if client is None:
                 logger.warning("resolve_provider_client: anthropic requested but no Anthropic credentials found")
                 return None, None
@@ -3522,6 +3571,13 @@ def resolve_provider_client(
 
         default_model = _get_aux_model_for_provider(provider)
         final_model = _normalize_resolved_model(model or default_model, provider)
+        try:
+            from agent.model_policy import reject_forbidden_model
+
+            if reject_forbidden_model(final_model, usage=f"auxiliary provider {provider}"):
+                return None, None
+        except Exception:
+            pass
 
         if provider == "gemini":
             from agent.gemini_native_adapter import GeminiNativeClient, is_native_gemini_base_url
@@ -3646,6 +3702,13 @@ def resolve_provider_client(
         region = resolve_bedrock_region()
         default_model = "anthropic.claude-haiku-4-5-20251001-v1:0"
         final_model = _normalize_resolved_model(model or default_model, provider)
+        try:
+            from agent.model_policy import reject_forbidden_model
+
+            if reject_forbidden_model(final_model, usage="bedrock auxiliary provider"):
+                return None, None
+        except Exception:
+            pass
         try:
             real_client = build_anthropic_bedrock_client(region)
         except ImportError as exc:
