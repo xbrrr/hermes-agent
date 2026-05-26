@@ -2,6 +2,16 @@
 
 Instructions for AI coding assistants and developers working on the hermes-agent codebase.
 
+## Agentic Stack Operating Rules
+
+These rules apply to Hermes/MM when coordinating work with Bud/OpenClaw or scheduled jobs for Mikhail:
+
+- Own the outcome, not just the message. If a task has a next step, it must already be delegated, scheduled, logged, or executed before reporting it.
+- No passive status without control. Do not write bare "ждём", "принято", or "следующий шаг"; include the concrete control artifact: `correlation_id`, `job_id`, file path, deadline, or verification time.
+- Bud handoff format is mandatory in Telegram topics with mention gating: `@iq5000_bot /task correlation_id=...`. Follow-up messages to Bud must also tag `@iq5000_bot` and reuse the same `correlation_id`.
+- Every delegated task needs a trackable record: owner, expected event, `next_check_at`, and escalation rule. If the durable handoff watchdog is not available, create a one-shot timer/cron immediately.
+- Close the loop before declaring success: verify execution, update the task record, cancel obsolete timers, and list residual gaps separately.
+
 ## Development Environment
 
 ```bash

@@ -122,6 +122,47 @@ _CHECK_FN_TTL_SECONDS = 30.0
 _check_fn_cache: Dict[Callable, tuple[float, bool]] = {}
 _check_fn_cache_lock = threading.Lock()
 
+# Idempotency cache for side-effecting tools.  The cache lives at the
+# central dispatcher so tool implementations stay simple and all gateway / CLI
+# paths share the same duplicate suppression.  Keys are intentionally scoped by
+# tool name; callers choose the idempotency_key value.
+_IDEMPOTENT_TOOLS = {"send_message", "cronjob", "skill_manage", "memory"}
+_IDEMPOTENCY_TTL_SECONDS = 300.0
+_idempotency_cache: Dict[tuple[str, str], tuple[float, str]] = {}
+_idempotency_cache_lock = threading.Lock()
+
+
+def _get_idempotency_key(name: str, args: dict) -> str | None:
+    if name not in _IDEMPOTENT_TOOLS or not isinstance(args, dict):
+        return None
+    raw = args.get("idempotency_key")
+    if raw is None:
+        return None
+    key = str(raw).strip()
+    return key or None
+
+
+def _idempotency_lookup(name: str, key: str) -> str | None:
+    now = time.monotonic()
+    cache_key = (name, key)
+    with _idempotency_cache_lock:
+        stale = [k for k, (ts, _) in _idempotency_cache.items() if now - ts >= _IDEMPOTENCY_TTL_SECONDS]
+        for stale_key in stale:
+            _idempotency_cache.pop(stale_key, None)
+        cached = _idempotency_cache.get(cache_key)
+        if cached is None:
+            return None
+        ts, result = cached
+        if now - ts < _IDEMPOTENCY_TTL_SECONDS:
+            return result
+        _idempotency_cache.pop(cache_key, None)
+    return None
+
+
+def _idempotency_store(name: str, key: str, result: str) -> None:
+    with _idempotency_cache_lock:
+        _idempotency_cache[(name, key)] = (time.monotonic(), result)
+
 
 def _check_fn_cached(fn: Callable) -> bool:
     """Return bool(fn()), TTL-cached across calls. Swallows exceptions as False."""
@@ -397,11 +438,20 @@ class ToolRegistry:
         entry = self.get_entry(name)
         if not entry:
             return json.dumps({"error": f"Unknown tool: {name}"})
+        idempotency_key = _get_idempotency_key(name, args)
+        if idempotency_key is not None:
+            cached = _idempotency_lookup(name, idempotency_key)
+            if cached is not None:
+                return cached
         try:
             if entry.is_async:
                 from model_tools import _run_async
-                return _run_async(entry.handler(args, **kwargs))
-            return entry.handler(args, **kwargs)
+                result = _run_async(entry.handler(args, **kwargs))
+            else:
+                result = entry.handler(args, **kwargs)
+            if idempotency_key is not None:
+                _idempotency_store(name, idempotency_key, result)
+            return result
         except Exception as e:
             logger.exception("Tool %s dispatch error: %s", name, e)
             # Route through the sanitizer so framing tokens / CDATA / fences

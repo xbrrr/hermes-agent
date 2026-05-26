@@ -262,6 +262,7 @@ _DEFAULT_CONNECT_TIMEOUT = 60    # seconds for initial connection per server
 _MAX_RECONNECT_RETRIES = 5
 _MAX_INITIAL_CONNECT_RETRIES = 3 # retries for the very first connection attempt
 _MAX_BACKOFF_SECONDS = 60
+_MCP_PROGRESSIVE_LOADING_DEFAULT = False
 
 # Environment variables that are safe to pass to stdio subprocesses
 _SAFE_ENV_KEYS = frozenset({
@@ -1255,6 +1256,15 @@ class MCPServerTask:
 
     async def _run_stdio(self, config: dict):
         """Run the server using stdio transport."""
+        if not _MCP_AVAILABLE:
+            raise ImportError(
+                f"MCP server '{self.name}' requires the 'mcp' Python SDK, but "
+                "it is not installed. Install with:\n"
+                "  pip install 'hermes-agent[mcp]'\n"
+                "or (full install):\n"
+                "  pip install 'hermes-agent[all]'"
+            )
+
         command = config.get("command")
         args = config.get("args", [])
         user_env = config.get("env")
@@ -2067,6 +2077,7 @@ def _handle_session_expired_and_retry(
 # Populated during ``register_mcp_servers()`` and queried by
 # ``is_mcp_tool_parallel_safe()`` for the parallel-execution check in run_agent.
 _parallel_safe_servers: set = set()
+_progressive_loaded_servers: set[str] = set()
 
 # Exact MCP tool-name provenance. MCP tool names are formatted as
 # ``mcp_{sanitized_server}_{sanitized_tool}``, which is ambiguous when server
@@ -3034,6 +3045,104 @@ def _select_utility_schemas(server_name: str, server: MCPServerTask, config: dic
     return selected
 
 
+def _parse_progressive_loading(config: dict) -> bool:
+    """Return whether this MCP server should expose lazy loading at startup."""
+    if "progressive_loading" in config:
+        return _parse_boolish(
+            config.get("progressive_loading"),
+            default=_MCP_PROGRESSIVE_LOADING_DEFAULT,
+        )
+    try:
+        from hermes_cli.config import load_config
+
+        root_cfg = load_config()
+        if "mcp_progressive_loading" in root_cfg:
+            return _parse_boolish(
+                root_cfg.get("mcp_progressive_loading"),
+                default=_MCP_PROGRESSIVE_LOADING_DEFAULT,
+            )
+    except Exception:
+        pass
+    return _MCP_PROGRESSIVE_LOADING_DEFAULT
+
+
+def _server_description(name: str, config: dict, server: MCPServerTask) -> str:
+    configured = config.get("description") or config.get("summary")
+    if configured:
+        return str(configured)
+    count = len(getattr(server, "_tools", []) or [])
+    transport = "HTTP" if "url" in config else "stdio"
+    return f"MCP server '{name}' over {transport}; {count} tool(s) available for lazy loading."
+
+
+def _make_load_tools_handler(server_name: str):
+    def _handler(_args, **_kw):
+        with _lock:
+            server = _servers.get(server_name)
+            if server is None:
+                return json.dumps({
+                    "error": f"MCP server '{server_name}' is not connected",
+                }, ensure_ascii=False)
+            config = dict(getattr(server, "_config", {}) or {})
+            already_loaded = server_name in _progressive_loaded_servers
+
+        if not already_loaded:
+            registered_names = _register_server_tools(
+                server_name,
+                server,
+                {**config, "progressive_loading": False},
+            )
+            server._registered_tool_names = list(registered_names)
+            with _lock:
+                _progressive_loaded_servers.add(server_name)
+        else:
+            registered_names = list(getattr(server, "_registered_tool_names", []) or [])
+
+        return json.dumps({
+            "success": True,
+            "server": server_name,
+            "loaded": True,
+            "tool_count": len(registered_names),
+            "tools": registered_names,
+            "message": (
+                "MCP tools are now registered. Continue by calling the specific "
+                "mcp_<server>_<tool> tool that matches the task."
+            ),
+        }, ensure_ascii=False)
+
+    return _handler
+
+
+def _register_server_loader(name: str, server: MCPServerTask, config: dict) -> List[str]:
+    """Register a lightweight per-server loader instead of every MCP tool."""
+    from tools.registry import registry
+
+    safe_name = sanitize_mcp_name_component(name)
+    toolset_name = f"mcp-{name}"
+    loader_name = f"mcp_{safe_name}_load_tools"
+    schema = {
+        "name": loader_name,
+        "description": (
+            f"Load tools for {_server_description(name, config, server)} "
+            "Use this first when a task needs this MCP server; it registers "
+            "the server's concrete tools on demand."
+        ),
+        "parameters": {"type": "object", "properties": {}},
+    }
+    registry.register(
+        name=loader_name,
+        toolset=toolset_name,
+        schema=schema,
+        handler=_make_load_tools_handler(name),
+        check_fn=_make_check_fn(name),
+        is_async=False,
+        description=schema["description"],
+    )
+    _track_mcp_tool_server(loader_name, name)
+    registry.register_toolset_alias(name, toolset_name)
+    return [loader_name]
+
+
 def _existing_tool_names() -> List[str]:
     """Return tool names for all currently connected servers."""
     names: List[str] = []
@@ -3060,6 +3169,9 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
         List of registered prefixed tool names.
     """
     from tools.registry import registry
+
+    if _parse_progressive_loading(config) and name not in _progressive_loaded_servers:
+        return _register_server_loader(name, server, config)
 
     registered_names: List[str] = []
     toolset_name = f"mcp-{name}"

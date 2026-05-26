@@ -47,6 +47,59 @@ class TestRegisterAndDispatch:
         result = json.loads(reg.dispatch("echo", {"msg": "hi"}))
         assert result == {"msg": "hi"}
 
+    def test_idempotency_key_suppresses_duplicate_side_effect_tool(self):
+        reg = ToolRegistry()
+        calls = {"count": 0}
+
+        def handler(args, **kw):
+            calls["count"] += 1
+            return json.dumps({"count": calls["count"]})
+
+        reg.register(
+            name="send_message",
+            toolset="core",
+            schema=_make_schema("send_message"),
+            handler=handler,
+        )
+
+        first = json.loads(reg.dispatch("send_message", {"idempotency_key": "same"}))
+        second = json.loads(reg.dispatch("send_message", {"idempotency_key": "same"}))
+
+        assert first == {"count": 1}
+        assert second == {"count": 1}
+        assert calls["count"] == 1
+
+    def test_idempotency_key_is_scoped_by_tool_name(self):
+        reg = ToolRegistry()
+        calls = {"send_message": 0, "memory": 0}
+
+        def send_handler(args, **kw):
+            calls["send_message"] += 1
+            return json.dumps({"tool": "send_message", "count": calls["send_message"]})
+
+        def memory_handler(args, **kw):
+            calls["memory"] += 1
+            return json.dumps({"tool": "memory", "count": calls["memory"]})
+
+        reg.register(
+            name="send_message",
+            toolset="core",
+            schema=_make_schema("send_message"),
+            handler=send_handler,
+        )
+        reg.register(
+            name="memory",
+            toolset="memory",
+            schema=_make_schema("memory"),
+            handler=memory_handler,
+        )
+
+        send_result = json.loads(reg.dispatch("send_message", {"idempotency_key": "scoped"}))
+        memory_result = json.loads(reg.dispatch("memory", {"idempotency_key": "scoped"}))
+
+        assert send_result == {"tool": "send_message", "count": 1}
+        assert memory_result == {"tool": "memory", "count": 1}
+
 
 class TestGetDefinitions:
     def test_returns_openai_format(self):

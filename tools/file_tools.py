@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """File Tools Module - LLM agent file manipulation tools."""
 
+import difflib
 import errno
 import json
 import logging
 import os
+import re
 import threading
 from pathlib import Path
 
@@ -127,21 +129,40 @@ def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path:
     return p.resolve()
 
 
-def _is_blocked_device(filepath: str) -> bool:
-    """Return True if the path would hang the process (infinite output or blocking input).
-
-    Uses the *literal* path — no symlink resolution — because the model
-    specifies paths directly and realpath follows symlinks all the way
-    through (e.g. /dev/stdin → /proc/self/fd/0 → /dev/pts/0), defeating
-    the check.
-    """
-    normalized = os.path.expanduser(filepath)
+def _is_blocked_device_path(path: str) -> bool:
+    """Return True for concrete device/fd paths that can hang reads."""
+    normalized = os.path.expanduser(path)
     if normalized in _BLOCKED_DEVICE_PATHS:
         return True
     # /proc/self/fd/0-2 and /proc/<pid>/fd/0-2 are Linux aliases for stdio
     if normalized.startswith("/proc/") and normalized.endswith(
         ("/fd/0", "/fd/1", "/fd/2")
     ):
+        return True
+    # /proc/*/environ, /proc/*/cmdline, /proc/*/maps can leak secrets,
+    # command-line args, and memory layout from the host process (issue #4427)
+    if normalized.startswith("/proc/") and normalized.endswith(
+        ("/environ", "/cmdline", "/maps")
+    ):
+        return True
+    return False
+
+
+def _is_blocked_device(filepath: str) -> bool:
+    """Return True if the path would hang the process (infinite output or blocking input).
+
+    Check the literal path first so aliases like /dev/stdin are caught before
+    they resolve to terminal-specific paths. Then check the resolved path so a
+    workspace symlink to /dev/zero cannot bypass the guard.
+    """
+    normalized = os.path.expanduser(filepath)
+    if _is_blocked_device_path(normalized):
+        return True
+    try:
+        resolved = os.path.realpath(normalized)
+    except (OSError, ValueError):
+        return False
+    if resolved != normalized and _is_blocked_device_path(resolved):
         return True
     return False
 
@@ -174,6 +195,37 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
     return None
 
 
+def _check_cross_profile_path(filepath: str, task_id: str = "default") -> str | None:
+    """Return a cross-profile warning string when ``filepath`` lands in
+    another Hermes profile's skills/plugins/cron/memories directory.
+
+    Returns ``None`` when the write is in-scope (same profile) or outside
+    Hermes scope entirely. Soft guard — the agent can override by passing
+    ``cross_profile=True`` to its write tool after explicit user direction.
+
+    Defense-in-depth, NOT a security boundary — the terminal tool runs
+    as the same OS user and can write any of these paths directly.
+    See ``agent/file_safety.classify_cross_profile_target`` for the
+    detection rules.
+    """
+    try:
+        from agent.file_safety import get_cross_profile_warning
+    except Exception:
+        # Fail open on import error — the existing sensitive-path guard
+        # plus the write_denied list still apply.
+        return None
+
+    # Resolve via the task's cwd so a relative ``skills/foo/SKILL.md``
+    # in a session that cd'd into ``~/.hermes/profiles/other/`` is
+    # classified against the right base.
+    try:
+        resolved = str(_resolve_path_for_task(filepath, task_id))
+    except (OSError, ValueError):
+        resolved = filepath
+
+    return get_cross_profile_warning(resolved)
+
+
 def _is_expected_write_exception(exc: Exception) -> bool:
     """Return True for expected write denials that should not hit error logs."""
     if isinstance(exc, PermissionError):
@@ -204,6 +256,43 @@ _file_ops_cache: dict = {}
 _read_tracker_lock = threading.Lock()
 _read_tracker: dict = {}
 
+# Track consecutive patch failures per (task_id, resolved_path).  Used to
+# escalate the hint when the model repeatedly fails to patch the same file
+# (typical cause: stale view of file contents, ambiguous old_string, or
+# the file was modified externally between the agent's read and patch
+# attempt).  Reset on a successful patch to that path.
+_patch_failure_lock = threading.Lock()
+_patch_failure_tracker: dict = {}  # {task_id: {resolved_path: count}}
+
+
+def _record_patch_failure(task_id: str, resolved_path: str) -> int:
+    """Increment and return the consecutive-failure count for this path."""
+    with _patch_failure_lock:
+        task_failures = _patch_failure_tracker.setdefault(task_id, {})
+        # Cap dict size per task to avoid unbounded growth in long sessions
+        # where the agent fails on many distinct files.  64 distinct
+        # failing files per task is generous; older entries get evicted.
+        if len(task_failures) >= 64 and resolved_path not in task_failures:
+            try:
+                first_key = next(iter(task_failures))
+                del task_failures[first_key]
+            except StopIteration:
+                pass
+        task_failures[resolved_path] = task_failures.get(resolved_path, 0) + 1
+        return task_failures[resolved_path]
+
+
+def _reset_patch_failures(task_id: str, resolved_paths: list) -> None:
+    """Clear consecutive-failure counts for the given paths."""
+    if not resolved_paths:
+        return
+    with _patch_failure_lock:
+        task_failures = _patch_failure_tracker.get(task_id)
+        if not task_failures:
+            return
+        for rp in resolved_paths:
+            task_failures.pop(rp, None)
+
 # Per-task bounds for the containers inside each _read_tracker[task_id].
 # A CLI session uses one stable task_id for its lifetime; without these
 # caps, a 10k-read session would accumulate ~1.5MB of dict/set state that
@@ -218,6 +307,10 @@ _READ_DEDUP_STATUS_MESSAGE = (
     "the earlier read_file result in this conversation is "
     "still current — refer to that instead of re-reading."
 )
+_CODE_OVERVIEW_EXTENSIONS = {".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}
+_SMART_READ_HEAD_LINES = 100
+_SMART_READ_SEARCH_RADIUS = 50
+_WRITE_FILE_AUTO_DRY_RUN_LINES = 1000
 
 
 def _cap_read_tracker_data(task_data: dict) -> None:
@@ -300,6 +393,165 @@ def _is_internal_file_status_text(content: str) -> bool:
             len(stripped) <= 2 * len(_READ_DEDUP_STATUS_MESSAGE):
         return True
     return False
+
+
+def _line_count(text: str) -> int:
+    """Return a practical line count for auto dry-run thresholds."""
+    if not text:
+        return 0
+    return text.count("\n") + (0 if text.endswith("\n") else 1)
+
+
+def _line_no_from_match(match: dict) -> int | None:
+    line = match.get("line") if isinstance(match, dict) else None
+    try:
+        line_no = int(line)
+    except (TypeError, ValueError):
+        return None
+    return line_no if line_no > 0 else None
+
+
+def _last_search_window_for_path(path: str, task_id: str) -> tuple[int, int] | None:
+    """Return an offset/limit around the latest search hit for *path*."""
+    try:
+        resolved = str(_resolve_path_for_task(path, task_id))
+    except (OSError, ValueError):
+        resolved = None
+
+    with _read_tracker_lock:
+        task_data = _read_tracker.get(task_id) or {}
+        matches = list(task_data.get("last_search_matches") or [])
+
+    for match in matches:
+        match_path = str(match.get("path") or "")
+        candidates = {match_path}
+        try:
+            candidates.add(str(_resolve_path_for_task(match_path, task_id)))
+        except (OSError, ValueError):
+            pass
+        if path not in candidates and (resolved is None or resolved not in candidates):
+            continue
+        line_no = _line_no_from_match(match)
+        if line_no is None:
+            continue
+        offset = max(1, line_no - _SMART_READ_SEARCH_RADIUS)
+        limit = (_SMART_READ_SEARCH_RADIUS * 2) + 1
+        return offset, limit
+    return None
+
+
+def _build_code_overview_content(raw_content: str) -> str:
+    """Build a compact first-read overview for source files."""
+    lines = raw_content.splitlines()
+    selected: dict[int, str] = {}
+    for idx, line in enumerate(lines[:_SMART_READ_HEAD_LINES], start=1):
+        selected[idx] = line
+
+    patterns = (
+        re.compile(r"^\s*(?:from\s+\S+\s+import\s+|import\s+)"),
+        re.compile(r"^\s*(?:async\s+def|def|class)\s+\w+"),
+        re.compile(r"^\s*(?:export\s+)?(?:async\s+)?function\s+\w+"),
+        re.compile(r"^\s*(?:export\s+)?class\s+\w+"),
+        re.compile(r"^\s*(?:export\s+)?(?:const|let|var)\s+\w+\s*=\s*(?:async\s*)?\("),
+        re.compile(r"^\s*import\s+.+\s+from\s+['\"]"),
+    )
+    for idx, line in enumerate(lines, start=1):
+        if any(pattern.search(line) for pattern in patterns):
+            selected[idx] = line
+
+    formatted: list[str] = []
+    previous = 0
+    for line_no in sorted(selected):
+        if previous and line_no > previous + 1:
+            formatted.append("...")
+        formatted.append(f"{line_no}|{selected[line_no]}")
+        previous = line_no
+    return "\n".join(formatted)
+
+
+def _dry_run_write_preview(path: str, content: str, file_ops) -> dict:
+    """Return lint + diff for a write without touching disk."""
+    raw = file_ops.read_file_raw(path)
+    old_content = "" if raw.error else (raw.content or "")
+    diff = "".join(difflib.unified_diff(
+        old_content.splitlines(keepends=True),
+        content.splitlines(keepends=True),
+        fromfile=f"a/{path}",
+        tofile=f"b/{path}",
+    ))
+    lint_result = (
+        file_ops._check_lint(path, content=content)
+        if hasattr(file_ops, "_check_lint") else None
+    )
+    result = {
+        "dry_run": True,
+        "would_write": True,
+        "path": path,
+        "bytes_would_write": len(content.encode("utf-8")),
+        "diff": diff,
+        "content_written": False,
+    }
+    if raw.error:
+        result["new_file"] = True
+    if lint_result and hasattr(lint_result, "to_dict"):
+        lint_dict = lint_result.to_dict()
+        if isinstance(lint_dict, dict):
+            result["lint"] = lint_dict
+    return result
+
+
+class _DryRunFileOperations:
+    """In-memory adapter for V4A dry-run patches."""
+
+    def __init__(self, file_ops):
+        self._file_ops = file_ops
+        self._files: dict[str, str] = {}
+        self._deleted: set[str] = set()
+
+    def read_file_raw(self, path: str):
+        from tools.file_operations import ReadResult
+
+        if path in self._deleted:
+            return ReadResult(error=f"File not found: {path}")
+        if path in self._files:
+            return ReadResult(content=self._files[path], file_size=len(self._files[path]))
+        result = self._file_ops.read_file_raw(path)
+        if not result.error:
+            self._files[path] = result.content or ""
+        return result
+
+    def write_file(self, path: str, content: str):
+        from tools.file_operations import WriteResult
+
+        self._files[path] = content
+        self._deleted.discard(path)
+        return WriteResult(bytes_written=len(content.encode("utf-8")))
+
+    def delete_file(self, path: str):
+        from tools.file_operations import WriteResult
+
+        self.read_file_raw(path)
+        self._files.pop(path, None)
+        self._deleted.add(path)
+        return WriteResult()
+
+    def move_file(self, src: str, dst: str):
+        from tools.file_operations import WriteResult
+
+        result = self.read_file_raw(src)
+        if result.error:
+            return WriteResult(error=result.error)
+        self._files[dst] = result.content or ""
+        self._files.pop(src, None)
+        self._deleted.add(src)
+        self._deleted.discard(dst)
+        return WriteResult()
+
+    def _check_lint(self, path: str):
+        content = self._files.get(path)
+        if content is None or not hasattr(self._file_ops, "_check_lint"):
+            return None
+        return self._file_ops._check_lint(path, content=content)
 
 
 def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
@@ -444,7 +696,8 @@ def clear_file_ops_cache(task_id: str = None):
             _file_ops_cache.clear()
 
 
-def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = "default") -> str:
+def read_file_tool(path: str, offset: int = 1, limit: int = 500,
+                   task_id: str = "default", smart_window: bool = False) -> str:
     """Read a file with pagination and line numbers."""
     try:
         offset, limit = normalize_read_pagination(offset, limit)
@@ -474,10 +727,38 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
             })
 
         # ── Hermes internal path guard ────────────────────────────────
-        # Prevent prompt injection via catalog or hub metadata files.
-        block_error = get_read_block_error(path)
+        # Prevent prompt injection via catalog or hub metadata files,
+        # and block credential stores under HERMES_HOME.  Pass the
+        # already-resolved path so a relative-path read against
+        # TERMINAL_CWD == HERMES_HOME (e.g. "auth.json") still hits the
+        # denylist — get_read_block_error's own resolve() runs against
+        # the Python process cwd, which can differ.
+        block_error = get_read_block_error(str(_resolved))
         if block_error:
             return json.dumps({"error": block_error})
+
+        if smart_window:
+            search_window = _last_search_window_for_path(path, task_id)
+            if search_window:
+                offset, limit = search_window
+            elif _resolved.suffix.lower() in _CODE_OVERVIEW_EXTENSIONS:
+                file_ops = _get_file_ops(task_id)
+                raw_result = file_ops.read_file_raw(path)
+                if raw_result.error:
+                    return json.dumps(raw_result.to_dict(), ensure_ascii=False)
+                overview_content = _build_code_overview_content(raw_result.content or "")
+                overview_content = redact_sensitive_text(overview_content, code_file=True)
+                return json.dumps({
+                    "content": overview_content,
+                    "total_lines": len((raw_result.content or "").splitlines()),
+                    "file_size": raw_result.file_size,
+                    "smart_window": "code_overview",
+                    "_hint": (
+                        "Smart overview returned: first 100 lines plus imports, "
+                        "class/function declarations, and exported JS/TS symbols. "
+                        "Use offset and limit to read a specific full section."
+                    ),
+                }, ensure_ascii=False)
 
         # ── Dedup check ───────────────────────────────────────────────
         # If we already read this exact (path, offset, limit) and the
@@ -790,17 +1071,43 @@ def _check_file_staleness(filepath: str, task_id: str) -> str | None:
     return None
 
 
-def write_file_tool(path: str, content: str, task_id: str = "default") -> str:
-    """Write content to a file."""
+def write_file_tool(path: str, content: str, task_id: str = "default",
+                    cross_profile: bool = False, dry_run: bool = False) -> str:
+    """Write content to a file.
+
+    ``cross_profile`` opts out of the soft cross-Hermes-profile guard. The
+    guard fires only on writes that land in another profile's
+    skills/plugins/cron/memories directory; everything else is unaffected.
+    Pass ``True`` after explicit user direction — same shape as ``force``
+    on the terminal tool.
+    """
     sensitive_err = _check_sensitive_path(path, task_id)
     if sensitive_err:
         return tool_error(sensitive_err)
+    if not cross_profile:
+        cross_warning = _check_cross_profile_path(path, task_id)
+        if cross_warning:
+            return tool_error(cross_warning)
     if _is_internal_file_status_text(content):
         return tool_error(
             "Refusing to write internal read_file status text as file content. "
             "Re-read the file or reconstruct the intended file contents before writing."
         )
     try:
+        auto_dry_run = _line_count(content) > _WRITE_FILE_AUTO_DRY_RUN_LINES
+        if dry_run or auto_dry_run:
+            file_ops = _get_file_ops(task_id)
+            result_dict = _dry_run_write_preview(path, content, file_ops)
+            if auto_dry_run and not dry_run:
+                result_dict["auto_dry_run"] = True
+                result_dict["_hint"] = (
+                    "write_file content exceeds 1000 lines, so Hermes returned "
+                    "a dry-run diff instead of writing. Re-issue with a smaller "
+                    "targeted patch, or explicitly confirm the full-file write "
+                    "outside this tool's dry-run path."
+                )
+            return json.dumps(result_dict, ensure_ascii=False)
+
         # Resolve once for the registry lock + stale check.  Failures here
         # fall back to the legacy path — write proceeds, per-task staleness
         # check below still runs.
@@ -849,20 +1156,46 @@ def write_file_tool(path: str, content: str, task_id: str = "default") -> str:
 
 def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                new_string: str = None, replace_all: bool = False, patch: str = None,
-               task_id: str = "default") -> str:
-    """Patch a file using replace mode or V4A patch format."""
+               task_id: str = "default", cross_profile: bool = False,
+               dry_run: bool = False) -> str:
+    """Patch a file using replace mode or V4A patch format.
+
+    ``cross_profile`` opts out of the soft cross-Hermes-profile guard for
+    targets under another profile's skills/plugins/cron/memories
+    directory. Same shape as ``write_file``'s flag.
+    """
     # Check sensitive paths for both replace (explicit path) and V4A patch (extract paths)
     _paths_to_check = []
     if path:
         _paths_to_check.append(path)
     if mode == "patch" and patch:
         import re as _re
+        from tools.path_security import has_traversal_component
         for _m in _re.finditer(r'^\*\*\*\s+(?:Update|Add|Delete)\s+File:\s*(.+)$', patch, _re.MULTILINE):
-            _paths_to_check.append(_m.group(1).strip())
+            v4a_path = _m.group(1).strip()
+            # V4A path headers come from patch CONTENT, not the explicit
+            # ``path=`` arg — so they're more attacker-influenceable (skill
+            # content, web extract, prompt injection). Reject ``..`` traversal
+            # in V4A headers: a legitimate multi-file patch from a single cwd
+            # can always emit absolute paths or paths relative to the agent's
+            # cwd without ``..``. The explicit ``path=`` arg is unchanged
+            # because the agent uses relative ``..`` paths legitimately
+            # (e.g. ``patch path="../other_module/x.py"`` from a worktree).
+            if has_traversal_component(v4a_path):
+                return tool_error(
+                    f"V4A patch header contains '..' traversal: {v4a_path!r}. "
+                    "Use the agent's cwd-relative path (no '..') or an absolute "
+                    "path in '*** Update File:' / '*** Add File:' / '*** Delete File:' headers."
+                )
+            _paths_to_check.append(v4a_path)
     for _p in _paths_to_check:
         sensitive_err = _check_sensitive_path(_p, task_id)
         if sensitive_err:
             return tool_error(sensitive_err)
+        if not cross_profile:
+            cross_warning = _check_cross_profile_path(_p, task_id)
+            if cross_warning:
+                return tool_error(cross_warning)
     try:
         # Resolve paths for locking.  Ordered + deduplicated so concurrent
         # callers lock in the same order — prevents deadlock on overlapping
@@ -909,31 +1242,111 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                     return tool_error("path required")
                 if old_string is None or new_string is None:
                     return tool_error("old_string and new_string required")
+                if dry_run:
+                    raw_result = file_ops.read_file_raw(path)
+                    if raw_result.error:
+                        return json.dumps({"error": raw_result.error}, ensure_ascii=False)
+                    from tools.fuzzy_match import fuzzy_find_and_replace
+
+                    new_content, match_count, _strategy, error = fuzzy_find_and_replace(
+                        raw_result.content or "", old_string, new_string, replace_all
+                    )
+                    if error or match_count == 0:
+                        return json.dumps({
+                            "error": error or f"Could not find match for old_string in {path}",
+                            "dry_run": True,
+                            "content_written": False,
+                        }, ensure_ascii=False)
+                    diff = "".join(difflib.unified_diff(
+                        (raw_result.content or "").splitlines(keepends=True),
+                        new_content.splitlines(keepends=True),
+                        fromfile=f"a/{path}",
+                        tofile=f"b/{path}",
+                    ))
+                    lint_result = (
+                        file_ops._check_lint(path, content=new_content)
+                        if hasattr(file_ops, "_check_lint") else None
+                    )
+                    result_dict = {
+                        "success": True,
+                        "dry_run": True,
+                        "content_written": False,
+                        "match_count": match_count,
+                        "diff": diff,
+                        "files_modified": [path],
+                    }
+                    if lint_result and hasattr(lint_result, "to_dict"):
+                        lint_dict = lint_result.to_dict()
+                        if isinstance(lint_dict, dict):
+                            result_dict["lint"] = lint_dict
+                    return json.dumps(result_dict, ensure_ascii=False)
                 result = file_ops.patch_replace(path, old_string, new_string, replace_all)
             elif mode == "patch":
                 if not patch:
                     return tool_error("patch content required")
-                result = file_ops.patch_v4a(patch)
+                if dry_run:
+                    from tools.patch_parser import parse_v4a_patch, apply_v4a_operations
+
+                    operations, parse_error = parse_v4a_patch(patch)
+                    if parse_error:
+                        return json.dumps({"error": parse_error, "dry_run": True}, ensure_ascii=False)
+                    result = apply_v4a_operations(operations, _DryRunFileOperations(file_ops))
+                else:
+                    result = file_ops.patch_v4a(patch)
             else:
                 return tool_error(f"Unknown mode: {mode}")
 
             result_dict = result.to_dict()
+            if dry_run:
+                result_dict["dry_run"] = True
+                result_dict["content_written"] = False
             if stale_warnings:
                 result_dict["_warning"] = stale_warnings[0] if len(stale_warnings) == 1 else " | ".join(stale_warnings)
             # Refresh stored timestamps for all successfully-patched paths so
             # consecutive edits by this task don't trigger false warnings.
-            if not result_dict.get("error"):
+            if not dry_run and not result_dict.get("error"):
                 for _p in _paths_to_check:
                     _update_read_timestamp(_p, task_id)
                     _r = _path_to_resolved.get(_p)
                     if _r:
                         file_state.note_write(task_id, _r)
+                # Successful patch: clear any prior consecutive-failure
+                # counters for the touched paths so a future failure on
+                # the same path starts the escalation cycle fresh.
+                _reset_patch_failures(task_id, [
+                    _r for _r in (_path_to_resolved.get(_p) for _p in _paths_to_check) if _r
+                ])
         # Hint when old_string not found — saves iterations where the agent
         # retries with stale content instead of re-reading the file.
         # Suppressed when patch_replace already attached a rich "Did you mean?"
         # snippet (which is strictly more useful than the generic hint).
         if result_dict.get("error") and "Could not find" in str(result_dict["error"]):
-            if "Did you mean one of these sections?" not in str(result_dict["error"]):
+            # Track per-file consecutive failures for replace mode.  The
+            # ``path`` arg only exists for replace mode; for V4A patches
+            # we'd need to walk the headers, but in practice V4A failures
+            # are far rarer and the existing _hint covers them adequately.
+            failure_count = 0
+            if mode == "replace" and path:
+                resolved = _path_to_resolved.get(path) or path
+                failure_count = _record_patch_failure(task_id, resolved)
+
+            if failure_count >= 3:
+                # Escalating hint after multiple consecutive failures on the
+                # same path.  Most common cause is a stale view of the file —
+                # the model is retrying with the same old_string against
+                # content that has since changed.  Surface the failure count
+                # so the model recognises it's in a loop and breaks out by
+                # re-reading or falling back to write_file.
+                result_dict["_hint"] = (
+                    f"This is failure #{failure_count} patching {path!r}. "
+                    "Stop retrying with variations of the same old_string. "
+                    "Either: (1) re-read the file fresh to verify current "
+                    "content, (2) use a longer / more unique old_string with "
+                    "surrounding context lines, or (3) use write_file to "
+                    "replace the entire file if the targeted region is hard "
+                    "to anchor."
+                )
+            elif "Did you mean one of these sections?" not in str(result_dict["error"]):
                 result_dict["_hint"] = (
                     "old_string not found. Use read_file to verify the current "
                     "content, or search_files to locate the text."
@@ -995,6 +1408,15 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
                 if hasattr(m, 'content') and m.content:
                     m.content = redact_sensitive_text(m.content, code_file=True)
         result_dict = result.to_dict()
+        if result_dict.get("matches"):
+            with _read_tracker_lock:
+                task_data = _read_tracker.setdefault(task_id, {
+                    "last_key": None, "consecutive": 0,
+                    "read_history": set(), "dedup": {},
+                    "dedup_hits": {}, "read_timestamps": {},
+                })
+                task_data["last_search_matches"] = list(result_dict["matches"])[:20]
+                _cap_read_tracker_data(task_data)
 
         if count >= 3:
             result_dict["_warning"] = (
@@ -1047,7 +1469,21 @@ WRITE_FILE_SCHEMA = {
         "type": "object",
         "properties": {
             "path": {"type": "string", "description": "Path to the file to write (will be created if it doesn't exist, overwritten if it does)"},
-            "content": {"type": "string", "description": "Complete content to write to the file"}
+            "content": {"type": "string", "description": "Complete content to write to the file"},
+            "cross_profile": {
+                "type": "boolean",
+                "description": "Opt out of the cross-profile soft guard. Defaults to false. Set true ONLY after explicit user direction to edit another Hermes profile's skills/plugins/cron/memories — by default these writes are blocked with a warning because they affect a different profile than the one this session is running under.",
+                "default": False,
+            },
+            "dry_run": {
+                "type": "boolean",
+                "description": (
+                    "Preview the write without touching disk. Returns a unified diff "
+                    "and syntax/lint result. Writes over 1000 lines are automatically "
+                    "converted to dry-run."
+                ),
+                "default": False,
+            },
         },
         "required": ["path", "content"]
     }
@@ -1094,6 +1530,16 @@ PATCH_SCHEMA = {
                 "type": "string",
                 "description": "REQUIRED when mode='patch'. V4A format patch content. Format:\n*** Begin Patch\n*** Update File: path/to/file\n@@ context hint @@\n context line\n-removed line\n+added line\n*** End Patch",
             },
+            "cross_profile": {
+                "type": "boolean",
+                "description": "Opt out of the cross-profile soft guard. Defaults to false. Set true ONLY after explicit user direction to edit another Hermes profile's skills/plugins/cron/memories.",
+                "default": False,
+            },
+            "dry_run": {
+                "type": "boolean",
+                "description": "Preview the patch in memory, returning diff and syntax/lint result without writing files.",
+                "default": False,
+            },
         },
         "required": ["mode"],
     },
@@ -1121,7 +1567,14 @@ SEARCH_FILES_SCHEMA = {
 
 def _handle_read_file(args, **kw):
     tid = kw.get("task_id") or "default"
-    return read_file_tool(path=args.get("path", ""), offset=args.get("offset", 1), limit=args.get("limit", 500), task_id=tid)
+    smart_window = "offset" not in args and "limit" not in args
+    return read_file_tool(
+        path=args.get("path", ""),
+        offset=args.get("offset", 1),
+        limit=args.get("limit", 500),
+        task_id=tid,
+        smart_window=smart_window,
+    )
 
 
 def _handle_write_file(args, **kw):
@@ -1144,7 +1597,11 @@ def _handle_write_file(args, **kw):
             f"write_file: 'content' must be a string, got "
             f"{type(args['content']).__name__}."
         )
-    return write_file_tool(path=args["path"], content=args["content"], task_id=tid)
+    return write_file_tool(
+        path=args["path"], content=args["content"], task_id=tid,
+        cross_profile=bool(args.get("cross_profile", False)),
+        dry_run=bool(args.get("dry_run", False)),
+    )
 
 
 def _handle_patch(args, **kw):
@@ -1152,7 +1609,10 @@ def _handle_patch(args, **kw):
     return patch_tool(
         mode=args.get("mode", "replace"), path=args.get("path"),
         old_string=args.get("old_string"), new_string=args.get("new_string"),
-        replace_all=args.get("replace_all", False), patch=args.get("patch"), task_id=tid)
+        replace_all=args.get("replace_all", False), patch=args.get("patch"), task_id=tid,
+        cross_profile=bool(args.get("cross_profile", False)),
+        dry_run=bool(args.get("dry_run", False)),
+    )
 
 
 def _handle_search_files(args, **kw):

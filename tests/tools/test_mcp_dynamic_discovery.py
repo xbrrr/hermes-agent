@@ -35,6 +35,45 @@ class TestRegisterServerTools:
             assert validate_toolset("my_srv") is True
             assert "mcp_my_srv_my_tool" in resolve_toolset("my_srv")
 
+    def test_progressive_loading_registers_loader_first(self, mock_registry):
+        """When enabled, startup exposes one lightweight loader per server."""
+        server = MCPServerTask("lazy_srv")
+        server._config = {"progressive_loading": True, "description": "Lazy server"}
+        server._tools = [_make_mcp_tool("heavy_tool", "heavy desc")]
+        server.session = MagicMock()
+
+        with patch("tools.registry.registry", mock_registry):
+            registered = _register_server_tools("lazy_srv", server, server._config)
+
+        assert registered == ["mcp_lazy_srv_load_tools"]
+        assert "mcp_lazy_srv_load_tools" in mock_registry.get_all_tool_names()
+        assert "mcp_lazy_srv_heavy_tool" not in mock_registry.get_all_tool_names()
+
+    def test_progressive_loader_registers_concrete_tools_on_call(self, mock_registry):
+        from tools import mcp_tool
+
+        server = MCPServerTask("lazy_call")
+        server._config = {"progressive_loading": True}
+        server._tools = [_make_mcp_tool("heavy_tool", "heavy desc")]
+        server.session = MagicMock()
+
+        with patch("tools.registry.registry", mock_registry), mcp_tool._lock:
+            mcp_tool._servers["lazy_call"] = server
+            mcp_tool._progressive_loaded_servers.discard("lazy_call")
+
+        try:
+            with patch("tools.registry.registry", mock_registry):
+                _register_server_tools("lazy_call", server, server._config)
+                loader = mock_registry.get_entry("mcp_lazy_call_load_tools")
+                result = loader.handler({})
+
+            assert "mcp_lazy_call_heavy_tool" in result
+            assert "mcp_lazy_call_heavy_tool" in mock_registry.get_all_tool_names()
+        finally:
+            with mcp_tool._lock:
+                mcp_tool._servers.pop("lazy_call", None)
+                mcp_tool._progressive_loaded_servers.discard("lazy_call")
+
 
 class TestRefreshTools:
     """Tests for MCPServerTask._refresh_tools nuke-and-repave cycle."""
