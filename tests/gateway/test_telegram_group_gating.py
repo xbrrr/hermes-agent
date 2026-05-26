@@ -11,6 +11,7 @@ from gateway.session import SessionSource
 def _make_adapter(
     require_mention=None,
     free_response_chats=None,
+    free_response_topics=None,
     mention_patterns=None,
     exclusive_bot_mentions=None,
     ignored_threads=None,
@@ -30,6 +31,8 @@ def _make_adapter(
         extra["require_mention"] = require_mention
     if free_response_chats is not None:
         extra["free_response_chats"] = free_response_chats
+    if free_response_topics is not None:
+        extra["free_response_topics"] = free_response_topics
     if mention_patterns is not None:
         extra["mention_patterns"] = mention_patterns
     if exclusive_bot_mentions is not None:
@@ -507,6 +510,25 @@ def test_free_response_chats_bypass_mention_requirement():
 
     assert adapter._should_process_message(_group_message("hello everyone", chat_id=-200)) is True
     assert adapter._should_process_message(_group_message("hello everyone", chat_id=-201)) is False
+
+
+def test_free_response_topics_bypass_mention_requirement_for_matching_topic_only():
+    adapter = _make_adapter(
+        require_mention=True,
+        allowed_chats=["-200"],
+        free_response_topics=[{"chat_id": "-200", "thread_id": "259"}],
+    )
+
+    assert adapter._should_process_message(_group_message("hello", chat_id=-200, thread_id=259)) is True
+    assert adapter._should_process_message(_group_message("hello", chat_id=-200, thread_id=1346)) is False
+    assert adapter._should_process_message(_group_message("hello", chat_id=-201, thread_id=259)) is False
+
+
+def test_free_response_topics_support_thread_only_shorthand():
+    adapter = _make_adapter(require_mention=True, free_response_topics=["259"])
+
+    assert adapter._should_process_message(_group_message("hello", chat_id=-200, thread_id=259)) is True
+    assert adapter._should_process_message(_group_message("hello", chat_id=-200, thread_id=260)) is False
 
 
 def test_guest_mode_allows_only_direct_mentions_outside_allowed_chats():

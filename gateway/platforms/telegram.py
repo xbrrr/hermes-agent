@@ -4261,6 +4261,80 @@ class TelegramAdapter(BasePlatformAdapter):
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
 
+    def _telegram_free_response_topics(self) -> set[tuple[str, str]]:
+        """Return (chat_id, thread_id) pairs that bypass mention gating.
+
+        Telegram forum topics are not separate chats: the chat id is the
+        supergroup id and the lane is carried by message_thread_id. A
+        chat-level free-response allowlist is too broad for multi-agent groups,
+        so free_response_topics lets operators make selected topics respond
+        without requiring an explicit bot mention.
+        """
+        raw = self.config.extra.get("free_response_topics")
+        if raw is None:
+            raw = os.getenv("TELEGRAM_FREE_RESPONSE_TOPICS", "")
+
+        if isinstance(raw, str):
+            text = raw.strip()
+            if not text:
+                return set()
+            try:
+                raw = json.loads(text)
+            except Exception:
+                raw = [part.strip() for part in re.split(r"[,\n]", text) if part.strip()]
+
+        if isinstance(raw, dict):
+            raw = [raw]
+        if not isinstance(raw, list):
+            logger.warning(
+                "[%s] telegram free_response_topics must be a list/dict/string; got %s",
+                self.name,
+                type(raw).__name__,
+            )
+            return set()
+
+        topics: set[tuple[str, str]] = set()
+        for item in raw:
+            chat_id: Optional[str] = None
+            thread_id: Optional[str] = None
+            if isinstance(item, dict):
+                chat_value = item.get("chat_id") or item.get("chat")
+                thread_value = (
+                    item.get("thread_id")
+                    or item.get("message_thread_id")
+                    or item.get("topic_id")
+                    or item.get("topic")
+                )
+                chat_id = str(chat_value).strip() if chat_value is not None else None
+                thread_id = str(thread_value).strip() if thread_value is not None else None
+            else:
+                text = str(item).strip()
+                if not text:
+                    continue
+                if ":" in text:
+                    chat_part, thread_part = text.rsplit(":", 1)
+                    chat_id = chat_part.strip()
+                    thread_id = thread_part.strip()
+                else:
+                    thread_id = text
+
+            if not thread_id:
+                logger.warning("[%s] Ignoring free_response_topics entry without thread_id: %r", self.name, item)
+                continue
+            if thread_id == "None":
+                thread_id = self._GENERAL_TOPIC_THREAD_ID
+            topics.add((chat_id or "*", thread_id))
+        return topics
+
+    def _is_telegram_free_response_topic(self, message: Message) -> bool:
+        chat_id = str(getattr(getattr(message, "chat", None), "id", ""))
+        thread_id_raw = getattr(message, "message_thread_id", None)
+        thread_id = str(thread_id_raw) if thread_id_raw is not None else self._GENERAL_TOPIC_THREAD_ID
+        return any(
+            (topic_chat_id == "*" or topic_chat_id == chat_id) and topic_thread_id == thread_id
+            for topic_chat_id, topic_thread_id in self._telegram_free_response_topics()
+        )
+
     def _telegram_allowed_chats(self) -> set[str]:
         """Return the whitelist of group/supergroup chat IDs the bot will respond in.
 
@@ -4584,7 +4658,7 @@ class TelegramAdapter(BasePlatformAdapter):
         # Only observe messages skipped by the require_mention gate.  If the
         # message would be processed normally, let the dispatcher handle it;
         # if require_mention is disabled, every group message is a request.
-        if chat_id_str in self._telegram_free_response_chats():
+        if chat_id_str in self._telegram_free_response_chats() or self._is_telegram_free_response_topic(message):
             return False
         if not self._telegram_require_mention():
             return False
@@ -4733,7 +4807,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
         if guest_mention:
             return True
-        if chat_id_str in self._telegram_free_response_chats():
+        if chat_id_str in self._telegram_free_response_chats() or self._is_telegram_free_response_topic(message):
             return True
         if not self._telegram_require_mention():
             return True
