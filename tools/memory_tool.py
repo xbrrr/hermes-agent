@@ -683,6 +683,10 @@ MEMORY_SCHEMA = {
                 "enum": ["add", "replace", "remove"],
                 "description": "The action to perform."
             },
+            "idempotency_key": {
+                "type": "string",
+                "description": "Optional duplicate-suppression key for memory mutations. Reusing the same key within 300 seconds returns the cached result instead of writing another duplicate entry."
+            },
             "target": {
                 "type": "string",
                 "enum": ["memory", "user"],
@@ -718,7 +722,6 @@ registry.register(
     check_fn=check_memory_requirements,
     emoji="🧠",
 )
-
 
 
 

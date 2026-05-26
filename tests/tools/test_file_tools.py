@@ -67,6 +67,62 @@ class TestReadFileHandler:
         assert "error" in result
         assert "terminal not available" in result["error"]
 
+    @patch("tools.file_tools._get_file_ops")
+    def test_handler_uses_code_overview_when_no_window_args(self, mock_get):
+        mock_ops = MagicMock()
+        result_obj = MagicMock()
+        result_obj.content = (
+            "import os\n"
+            "\n"
+            "def top():\n"
+            "    pass\n"
+            + "\n".join(f"x{i} = {i}" for i in range(150))
+            + "\nclass Tail:\n    pass\n"
+        )
+        result_obj.file_size = len(result_obj.content)
+        result_obj.error = None
+        mock_ops.read_file_raw.return_value = result_obj
+        mock_get.return_value = mock_ops
+
+        from tools.file_tools import _handle_read_file
+        result = json.loads(_handle_read_file({"path": "/tmp/app.py"}))
+
+        assert result["smart_window"] == "code_overview"
+        assert "1|import os" in result["content"]
+        assert "155|class Tail:" in result["content"]
+        mock_ops.read_file.assert_not_called()
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_handler_uses_last_search_window_when_no_window_args(self, mock_get):
+        from tools import file_tools
+        from tools.file_tools import _handle_read_file
+
+        task_id = "smart-search-test"
+        with file_tools._read_tracker_lock:
+            file_tools._read_tracker[task_id] = {
+                "last_key": None,
+                "consecutive": 0,
+                "read_history": set(),
+                "dedup": {},
+                "dedup_hits": {},
+                "read_timestamps": {},
+                "last_search_matches": [{"path": "/tmp/app.py", "line": 120, "content": "needle"}],
+            }
+
+        mock_ops = MagicMock()
+        result_obj = MagicMock()
+        result_obj.content = "window"
+        result_obj.to_dict.return_value = {"content": "window", "total_lines": 200}
+        mock_ops.read_file.return_value = result_obj
+        mock_get.return_value = mock_ops
+
+        try:
+            _handle_read_file({"path": "/tmp/app.py"}, task_id=task_id)
+            mock_ops.read_file.assert_called_once_with("/tmp/app.py", 70, 101)
+        finally:
+            with file_tools._read_tracker_lock:
+                file_tools._read_tracker.pop(task_id, None)
+
 
 class TestWriteFileHandler:
     @patch("tools.file_tools._get_file_ops")
@@ -141,6 +197,39 @@ class TestWriteFileHandler:
         result = json.loads(_handle_write_file({"path": "/tmp/x.txt", "content": {"nested": "dict"}}))
         assert "error" in result
         assert "string" in result["error"].lower() or "content" in result["error"].lower()
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_write_file_dry_run_returns_diff_without_writing(self, mock_get):
+        mock_ops = MagicMock()
+        raw = MagicMock(error=None, content="old\n", file_size=4)
+        lint = MagicMock()
+        lint.to_dict.return_value = {"status": "ok", "output": ""}
+        mock_ops.read_file_raw.return_value = raw
+        mock_ops._check_lint.return_value = lint
+        mock_get.return_value = mock_ops
+
+        from tools.file_tools import write_file_tool
+        result = json.loads(write_file_tool("/tmp/out.py", "new\n", dry_run=True))
+
+        assert result["dry_run"] is True
+        assert result["content_written"] is False
+        assert "-old" in result["diff"]
+        assert "+new" in result["diff"]
+        mock_ops.write_file.assert_not_called()
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_write_file_over_1000_lines_auto_dry_run(self, mock_get):
+        mock_ops = MagicMock()
+        raw = MagicMock(error=None, content="", file_size=0)
+        mock_ops.read_file_raw.return_value = raw
+        mock_get.return_value = mock_ops
+
+        from tools.file_tools import write_file_tool
+        result = json.loads(write_file_tool("/tmp/huge.txt", "\n".join(str(i) for i in range(1001))))
+
+        assert result["dry_run"] is True
+        assert result["auto_dry_run"] is True
+        mock_ops.write_file.assert_not_called()
 
 
 class TestPatchHandler:
@@ -249,6 +338,28 @@ class TestPatchHandler:
         ))
         assert "error" in result
         assert "traversal" in result["error"].lower()
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_replace_mode_dry_run_returns_diff_without_patching(self, mock_get):
+        mock_ops = MagicMock()
+        raw = MagicMock(error=None, content="alpha\n", file_size=6)
+        mock_ops.read_file_raw.return_value = raw
+        mock_get.return_value = mock_ops
+
+        from tools.file_tools import patch_tool
+        result = json.loads(patch_tool(
+            mode="replace",
+            path="/tmp/f.py",
+            old_string="alpha",
+            new_string="beta",
+            dry_run=True,
+        ))
+
+        assert result["dry_run"] is True
+        assert result["content_written"] is False
+        assert "-alpha" in result["diff"]
+        assert "+beta" in result["diff"]
+        mock_ops.patch_replace.assert_not_called()
 
 
 class TestSearchHandler:

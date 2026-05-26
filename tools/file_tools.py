@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """File Tools Module - LLM agent file manipulation tools."""
 
+import difflib
 import errno
 import json
 import logging
 import os
+import re
 import threading
 from pathlib import Path
 
@@ -305,6 +307,10 @@ _READ_DEDUP_STATUS_MESSAGE = (
     "the earlier read_file result in this conversation is "
     "still current — refer to that instead of re-reading."
 )
+_CODE_OVERVIEW_EXTENSIONS = {".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}
+_SMART_READ_HEAD_LINES = 100
+_SMART_READ_SEARCH_RADIUS = 50
+_WRITE_FILE_AUTO_DRY_RUN_LINES = 1000
 
 
 def _cap_read_tracker_data(task_data: dict) -> None:
@@ -387,6 +393,165 @@ def _is_internal_file_status_text(content: str) -> bool:
             len(stripped) <= 2 * len(_READ_DEDUP_STATUS_MESSAGE):
         return True
     return False
+
+
+def _line_count(text: str) -> int:
+    """Return a practical line count for auto dry-run thresholds."""
+    if not text:
+        return 0
+    return text.count("\n") + (0 if text.endswith("\n") else 1)
+
+
+def _line_no_from_match(match: dict) -> int | None:
+    line = match.get("line") if isinstance(match, dict) else None
+    try:
+        line_no = int(line)
+    except (TypeError, ValueError):
+        return None
+    return line_no if line_no > 0 else None
+
+
+def _last_search_window_for_path(path: str, task_id: str) -> tuple[int, int] | None:
+    """Return an offset/limit around the latest search hit for *path*."""
+    try:
+        resolved = str(_resolve_path_for_task(path, task_id))
+    except (OSError, ValueError):
+        resolved = None
+
+    with _read_tracker_lock:
+        task_data = _read_tracker.get(task_id) or {}
+        matches = list(task_data.get("last_search_matches") or [])
+
+    for match in matches:
+        match_path = str(match.get("path") or "")
+        candidates = {match_path}
+        try:
+            candidates.add(str(_resolve_path_for_task(match_path, task_id)))
+        except (OSError, ValueError):
+            pass
+        if path not in candidates and (resolved is None or resolved not in candidates):
+            continue
+        line_no = _line_no_from_match(match)
+        if line_no is None:
+            continue
+        offset = max(1, line_no - _SMART_READ_SEARCH_RADIUS)
+        limit = (_SMART_READ_SEARCH_RADIUS * 2) + 1
+        return offset, limit
+    return None
+
+
+def _build_code_overview_content(raw_content: str) -> str:
+    """Build a compact first-read overview for source files."""
+    lines = raw_content.splitlines()
+    selected: dict[int, str] = {}
+    for idx, line in enumerate(lines[:_SMART_READ_HEAD_LINES], start=1):
+        selected[idx] = line
+
+    patterns = (
+        re.compile(r"^\s*(?:from\s+\S+\s+import\s+|import\s+)"),
+        re.compile(r"^\s*(?:async\s+def|def|class)\s+\w+"),
+        re.compile(r"^\s*(?:export\s+)?(?:async\s+)?function\s+\w+"),
+        re.compile(r"^\s*(?:export\s+)?class\s+\w+"),
+        re.compile(r"^\s*(?:export\s+)?(?:const|let|var)\s+\w+\s*=\s*(?:async\s*)?\("),
+        re.compile(r"^\s*import\s+.+\s+from\s+['\"]"),
+    )
+    for idx, line in enumerate(lines, start=1):
+        if any(pattern.search(line) for pattern in patterns):
+            selected[idx] = line
+
+    formatted: list[str] = []
+    previous = 0
+    for line_no in sorted(selected):
+        if previous and line_no > previous + 1:
+            formatted.append("...")
+        formatted.append(f"{line_no}|{selected[line_no]}")
+        previous = line_no
+    return "\n".join(formatted)
+
+
+def _dry_run_write_preview(path: str, content: str, file_ops) -> dict:
+    """Return lint + diff for a write without touching disk."""
+    raw = file_ops.read_file_raw(path)
+    old_content = "" if raw.error else (raw.content or "")
+    diff = "".join(difflib.unified_diff(
+        old_content.splitlines(keepends=True),
+        content.splitlines(keepends=True),
+        fromfile=f"a/{path}",
+        tofile=f"b/{path}",
+    ))
+    lint_result = (
+        file_ops._check_lint(path, content=content)
+        if hasattr(file_ops, "_check_lint") else None
+    )
+    result = {
+        "dry_run": True,
+        "would_write": True,
+        "path": path,
+        "bytes_would_write": len(content.encode("utf-8")),
+        "diff": diff,
+        "content_written": False,
+    }
+    if raw.error:
+        result["new_file"] = True
+    if lint_result and hasattr(lint_result, "to_dict"):
+        lint_dict = lint_result.to_dict()
+        if isinstance(lint_dict, dict):
+            result["lint"] = lint_dict
+    return result
+
+
+class _DryRunFileOperations:
+    """In-memory adapter for V4A dry-run patches."""
+
+    def __init__(self, file_ops):
+        self._file_ops = file_ops
+        self._files: dict[str, str] = {}
+        self._deleted: set[str] = set()
+
+    def read_file_raw(self, path: str):
+        from tools.file_operations import ReadResult
+
+        if path in self._deleted:
+            return ReadResult(error=f"File not found: {path}")
+        if path in self._files:
+            return ReadResult(content=self._files[path], file_size=len(self._files[path]))
+        result = self._file_ops.read_file_raw(path)
+        if not result.error:
+            self._files[path] = result.content or ""
+        return result
+
+    def write_file(self, path: str, content: str):
+        from tools.file_operations import WriteResult
+
+        self._files[path] = content
+        self._deleted.discard(path)
+        return WriteResult(bytes_written=len(content.encode("utf-8")))
+
+    def delete_file(self, path: str):
+        from tools.file_operations import WriteResult
+
+        self.read_file_raw(path)
+        self._files.pop(path, None)
+        self._deleted.add(path)
+        return WriteResult()
+
+    def move_file(self, src: str, dst: str):
+        from tools.file_operations import WriteResult
+
+        result = self.read_file_raw(src)
+        if result.error:
+            return WriteResult(error=result.error)
+        self._files[dst] = result.content or ""
+        self._files.pop(src, None)
+        self._deleted.add(src)
+        self._deleted.discard(dst)
+        return WriteResult()
+
+    def _check_lint(self, path: str):
+        content = self._files.get(path)
+        if content is None or not hasattr(self._file_ops, "_check_lint"):
+            return None
+        return self._file_ops._check_lint(path, content=content)
 
 
 def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
@@ -531,7 +696,8 @@ def clear_file_ops_cache(task_id: str = None):
             _file_ops_cache.clear()
 
 
-def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = "default") -> str:
+def read_file_tool(path: str, offset: int = 1, limit: int = 500,
+                   task_id: str = "default", smart_window: bool = False) -> str:
     """Read a file with pagination and line numbers."""
     try:
         offset, limit = normalize_read_pagination(offset, limit)
@@ -570,6 +736,29 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
         block_error = get_read_block_error(str(_resolved))
         if block_error:
             return json.dumps({"error": block_error})
+
+        if smart_window:
+            search_window = _last_search_window_for_path(path, task_id)
+            if search_window:
+                offset, limit = search_window
+            elif _resolved.suffix.lower() in _CODE_OVERVIEW_EXTENSIONS:
+                file_ops = _get_file_ops(task_id)
+                raw_result = file_ops.read_file_raw(path)
+                if raw_result.error:
+                    return json.dumps(raw_result.to_dict(), ensure_ascii=False)
+                overview_content = _build_code_overview_content(raw_result.content or "")
+                overview_content = redact_sensitive_text(overview_content, code_file=True)
+                return json.dumps({
+                    "content": overview_content,
+                    "total_lines": len((raw_result.content or "").splitlines()),
+                    "file_size": raw_result.file_size,
+                    "smart_window": "code_overview",
+                    "_hint": (
+                        "Smart overview returned: first 100 lines plus imports, "
+                        "class/function declarations, and exported JS/TS symbols. "
+                        "Use offset and limit to read a specific full section."
+                    ),
+                }, ensure_ascii=False)
 
         # ── Dedup check ───────────────────────────────────────────────
         # If we already read this exact (path, offset, limit) and the
@@ -883,7 +1072,7 @@ def _check_file_staleness(filepath: str, task_id: str) -> str | None:
 
 
 def write_file_tool(path: str, content: str, task_id: str = "default",
-                    cross_profile: bool = False) -> str:
+                    cross_profile: bool = False, dry_run: bool = False) -> str:
     """Write content to a file.
 
     ``cross_profile`` opts out of the soft cross-Hermes-profile guard. The
@@ -905,6 +1094,20 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             "Re-read the file or reconstruct the intended file contents before writing."
         )
     try:
+        auto_dry_run = _line_count(content) > _WRITE_FILE_AUTO_DRY_RUN_LINES
+        if dry_run or auto_dry_run:
+            file_ops = _get_file_ops(task_id)
+            result_dict = _dry_run_write_preview(path, content, file_ops)
+            if auto_dry_run and not dry_run:
+                result_dict["auto_dry_run"] = True
+                result_dict["_hint"] = (
+                    "write_file content exceeds 1000 lines, so Hermes returned "
+                    "a dry-run diff instead of writing. Re-issue with a smaller "
+                    "targeted patch, or explicitly confirm the full-file write "
+                    "outside this tool's dry-run path."
+                )
+            return json.dumps(result_dict, ensure_ascii=False)
+
         # Resolve once for the registry lock + stale check.  Failures here
         # fall back to the legacy path — write proceeds, per-task staleness
         # check below still runs.
@@ -953,7 +1156,8 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
 
 def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                new_string: str = None, replace_all: bool = False, patch: str = None,
-               task_id: str = "default", cross_profile: bool = False) -> str:
+               task_id: str = "default", cross_profile: bool = False,
+               dry_run: bool = False) -> str:
     """Patch a file using replace mode or V4A patch format.
 
     ``cross_profile`` opts out of the soft cross-Hermes-profile guard for
@@ -1038,20 +1242,69 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                     return tool_error("path required")
                 if old_string is None or new_string is None:
                     return tool_error("old_string and new_string required")
+                if dry_run:
+                    raw_result = file_ops.read_file_raw(path)
+                    if raw_result.error:
+                        return json.dumps({"error": raw_result.error}, ensure_ascii=False)
+                    from tools.fuzzy_match import fuzzy_find_and_replace
+
+                    new_content, match_count, _strategy, error = fuzzy_find_and_replace(
+                        raw_result.content or "", old_string, new_string, replace_all
+                    )
+                    if error or match_count == 0:
+                        return json.dumps({
+                            "error": error or f"Could not find match for old_string in {path}",
+                            "dry_run": True,
+                            "content_written": False,
+                        }, ensure_ascii=False)
+                    diff = "".join(difflib.unified_diff(
+                        (raw_result.content or "").splitlines(keepends=True),
+                        new_content.splitlines(keepends=True),
+                        fromfile=f"a/{path}",
+                        tofile=f"b/{path}",
+                    ))
+                    lint_result = (
+                        file_ops._check_lint(path, content=new_content)
+                        if hasattr(file_ops, "_check_lint") else None
+                    )
+                    result_dict = {
+                        "success": True,
+                        "dry_run": True,
+                        "content_written": False,
+                        "match_count": match_count,
+                        "diff": diff,
+                        "files_modified": [path],
+                    }
+                    if lint_result and hasattr(lint_result, "to_dict"):
+                        lint_dict = lint_result.to_dict()
+                        if isinstance(lint_dict, dict):
+                            result_dict["lint"] = lint_dict
+                    return json.dumps(result_dict, ensure_ascii=False)
                 result = file_ops.patch_replace(path, old_string, new_string, replace_all)
             elif mode == "patch":
                 if not patch:
                     return tool_error("patch content required")
-                result = file_ops.patch_v4a(patch)
+                if dry_run:
+                    from tools.patch_parser import parse_v4a_patch, apply_v4a_operations
+
+                    operations, parse_error = parse_v4a_patch(patch)
+                    if parse_error:
+                        return json.dumps({"error": parse_error, "dry_run": True}, ensure_ascii=False)
+                    result = apply_v4a_operations(operations, _DryRunFileOperations(file_ops))
+                else:
+                    result = file_ops.patch_v4a(patch)
             else:
                 return tool_error(f"Unknown mode: {mode}")
 
             result_dict = result.to_dict()
+            if dry_run:
+                result_dict["dry_run"] = True
+                result_dict["content_written"] = False
             if stale_warnings:
                 result_dict["_warning"] = stale_warnings[0] if len(stale_warnings) == 1 else " | ".join(stale_warnings)
             # Refresh stored timestamps for all successfully-patched paths so
             # consecutive edits by this task don't trigger false warnings.
-            if not result_dict.get("error"):
+            if not dry_run and not result_dict.get("error"):
                 for _p in _paths_to_check:
                     _update_read_timestamp(_p, task_id)
                     _r = _path_to_resolved.get(_p)
@@ -1155,6 +1408,15 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
                 if hasattr(m, 'content') and m.content:
                     m.content = redact_sensitive_text(m.content, code_file=True)
         result_dict = result.to_dict()
+        if result_dict.get("matches"):
+            with _read_tracker_lock:
+                task_data = _read_tracker.setdefault(task_id, {
+                    "last_key": None, "consecutive": 0,
+                    "read_history": set(), "dedup": {},
+                    "dedup_hits": {}, "read_timestamps": {},
+                })
+                task_data["last_search_matches"] = list(result_dict["matches"])[:20]
+                _cap_read_tracker_data(task_data)
 
         if count >= 3:
             result_dict["_warning"] = (
@@ -1213,6 +1475,15 @@ WRITE_FILE_SCHEMA = {
                 "description": "Opt out of the cross-profile soft guard. Defaults to false. Set true ONLY after explicit user direction to edit another Hermes profile's skills/plugins/cron/memories — by default these writes are blocked with a warning because they affect a different profile than the one this session is running under.",
                 "default": False,
             },
+            "dry_run": {
+                "type": "boolean",
+                "description": (
+                    "Preview the write without touching disk. Returns a unified diff "
+                    "and syntax/lint result. Writes over 1000 lines are automatically "
+                    "converted to dry-run."
+                ),
+                "default": False,
+            },
         },
         "required": ["path", "content"]
     }
@@ -1264,6 +1535,11 @@ PATCH_SCHEMA = {
                 "description": "Opt out of the cross-profile soft guard. Defaults to false. Set true ONLY after explicit user direction to edit another Hermes profile's skills/plugins/cron/memories.",
                 "default": False,
             },
+            "dry_run": {
+                "type": "boolean",
+                "description": "Preview the patch in memory, returning diff and syntax/lint result without writing files.",
+                "default": False,
+            },
         },
         "required": ["mode"],
     },
@@ -1291,7 +1567,14 @@ SEARCH_FILES_SCHEMA = {
 
 def _handle_read_file(args, **kw):
     tid = kw.get("task_id") or "default"
-    return read_file_tool(path=args.get("path", ""), offset=args.get("offset", 1), limit=args.get("limit", 500), task_id=tid)
+    smart_window = "offset" not in args and "limit" not in args
+    return read_file_tool(
+        path=args.get("path", ""),
+        offset=args.get("offset", 1),
+        limit=args.get("limit", 500),
+        task_id=tid,
+        smart_window=smart_window,
+    )
 
 
 def _handle_write_file(args, **kw):
@@ -1317,6 +1600,7 @@ def _handle_write_file(args, **kw):
     return write_file_tool(
         path=args["path"], content=args["content"], task_id=tid,
         cross_profile=bool(args.get("cross_profile", False)),
+        dry_run=bool(args.get("dry_run", False)),
     )
 
 
@@ -1327,6 +1611,7 @@ def _handle_patch(args, **kw):
         old_string=args.get("old_string"), new_string=args.get("new_string"),
         replace_all=args.get("replace_all", False), patch=args.get("patch"), task_id=tid,
         cross_profile=bool(args.get("cross_profile", False)),
+        dry_run=bool(args.get("dry_run", False)),
     )
 
 

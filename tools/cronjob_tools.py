@@ -800,6 +800,10 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
                 "type": "string",
                 "description": "Optional Hermes profile name to run the job under. When set, the scheduler resolves that profile, applies a context-local Hermes home override, loads that profile's config/.env for the run, and bridges HERMES_HOME into subprocesses. Any temporary process-environment changes from profile .env loading are restored after the job exits. Use 'default' for the root Hermes profile. Named profiles must already exist. When unset (default), preserves the scheduler's existing profile. On update, pass an empty string to clear. Jobs with profile run sequentially (not parallel) to keep profile-scoped runtime state isolated."
             },
+            "idempotency_key": {
+                "type": "string",
+                "description": "Optional duplicate-suppression key for action='create'. Reusing the same key within 300 seconds returns the cached result instead of creating another job."
+            },
         },
         "required": ["action"]
     }

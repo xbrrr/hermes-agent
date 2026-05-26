@@ -39,6 +39,7 @@ from agent.prompt_builder import (
     SKILLS_GUIDANCE,
     TOOL_USE_ENFORCEMENT_GUIDANCE,
     TOOL_USE_ENFORCEMENT_MODELS,
+    EXTERNAL_CONTENT_GUIDANCE,
 )
 
 
@@ -120,6 +121,12 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         tool_guidance.append(KANBAN_GUIDANCE)
     if tool_guidance:
         stable_parts.append(" ".join(tool_guidance))
+
+    if (
+        {"web_search", "web_extract", "web_fetch"} & set(agent.valid_tool_names)
+        or any(name.startswith(("browser_", "mcp_")) for name in agent.valid_tool_names)
+    ):
+        stable_parts.append(EXTERNAL_CONTENT_GUIDANCE)
 
     # Computer-use (macOS) — goes in as its own block rather than being
     # merged into tool_guidance because the content is multi-paragraph.

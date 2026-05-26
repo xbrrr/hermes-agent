@@ -11,6 +11,7 @@ from gateway.session import SessionSource
 def _make_adapter(
     require_mention=None,
     free_response_chats=None,
+    free_response_topics=None,
     mention_patterns=None,
     exclusive_bot_mentions=None,
     ignored_threads=None,
@@ -30,6 +31,8 @@ def _make_adapter(
         extra["require_mention"] = require_mention
     if free_response_chats is not None:
         extra["free_response_chats"] = free_response_chats
+    if free_response_topics is not None:
+        extra["free_response_topics"] = free_response_topics
     if mention_patterns is not None:
         extra["mention_patterns"] = mention_patterns
     if exclusive_bot_mentions is not None:
@@ -543,6 +546,26 @@ def test_free_response_chats_bypass_mention_requirement():
     assert adapter._should_process_message(_group_message("hello everyone", chat_id=-201)) is False
 
 
+def test_free_response_topics_bypass_mention_requirement_only_for_matching_topic():
+    adapter = _make_adapter(
+        require_mention=True,
+        allowed_chats=["-100"],
+        free_response_topics=[{"chat_id": "-100", "thread_id": "1346"}],
+    )
+
+    assert adapter._should_process_message(_group_message("hello", chat_id=-100, thread_id=1346)) is True
+    assert adapter._should_process_message(_group_message("hello", chat_id=-100, thread_id=92)) is False
+    assert adapter._should_process_message(_group_message("hello", chat_id=-200, thread_id=1346)) is False
+
+
+def test_free_response_topics_support_string_entries_and_general_topic():
+    adapter = _make_adapter(require_mention=True, free_response_topics=["-100:1", "-200:92"])
+
+    assert adapter._should_process_message(_group_message("hello", chat_id=-100, thread_id=None)) is True
+    assert adapter._should_process_message(_group_message("hello", chat_id=-200, thread_id=92)) is True
+    assert adapter._should_process_message(_group_message("hello", chat_id=-200, thread_id=93)) is False
+
+
 def test_guest_mode_allows_only_direct_mentions_outside_allowed_chats():
     adapter = _make_adapter(
         require_mention=True,
@@ -654,7 +677,10 @@ def test_config_bridges_telegram_group_settings(monkeypatch, tmp_path):
         "  group_allowed_chats:\n"
         "    - \"-100\"\n"
         "  allowed_topics:\n"
-        "    - 8\n",
+        "    - 8\n"
+        "  free_response_topics:\n"
+        "    - chat_id: \"-100\"\n"
+        "      thread_id: \"1346\"\n",
         encoding="utf-8",
     )
 
@@ -687,6 +713,7 @@ def test_config_bridges_telegram_group_settings(monkeypatch, tmp_path):
     assert tg_cfg.extra.get("allowed_chats") == ["-100"]
     assert tg_cfg.extra.get("group_allowed_chats") == ["-100"]
     assert tg_cfg.extra.get("allowed_topics") == [8]
+    assert tg_cfg.extra.get("free_response_topics") == [{"chat_id": "-100", "thread_id": "1346"}]
     assert tg_cfg.extra.get("exclusive_bot_mentions") is True
     assert tg_cfg.extra.get("observe_unmentioned_group_messages") is True
 

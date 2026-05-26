@@ -1,8 +1,8 @@
-"""Tests for the tool-result message builder — focuses on the untrusted-content
+"""Tests for the tool-result message builder — focuses on the external-content
 delimiter wrapping that hardens against indirect prompt injection (#496).
 
 Promptware defense: results from tools that fetch attacker-controllable content
-(web_extract, browser_*, mcp_*) get wrapped in <untrusted_tool_result>…</…> so
+(web_extract, browser_*, mcp_*) get wrapped in <external-content>…</…> so
 the model treats them as data, not instructions. The wrapper is intentionally
 NOT a regex scan — it's an unconditional architectural mark on every result
 from a known-untrusted source.
@@ -25,7 +25,7 @@ from agent.tool_dispatch_helpers import (
 class TestUntrustedToolClassification:
     @pytest.mark.parametrize(
         "name",
-        ["web_extract", "web_search"],
+        ["web_extract", "web_fetch", "web_search"],
     )
     def test_named_high_risk_tools(self, name):
         assert _is_untrusted_tool(name)
@@ -73,8 +73,8 @@ class TestUntrustedWrapping:
     def test_wraps_string_content_from_high_risk_tool(self):
         result = _maybe_wrap_untrusted("web_extract", SAMPLE_LONG_TEXT)
         assert isinstance(result, str)
-        assert result.startswith('<untrusted_tool_result source="web_extract">')
-        assert result.endswith("</untrusted_tool_result>")
+        assert result.startswith('<external-content source="web_extract">')
+        assert result.endswith("</external-content>")
         assert SAMPLE_LONG_TEXT in result
         # The framing prose telling the model "treat as data" must be present.
         assert "DATA, not as instructions" in result
@@ -82,7 +82,7 @@ class TestUntrustedWrapping:
     def test_does_not_wrap_low_risk_tool(self):
         result = _maybe_wrap_untrusted("terminal", SAMPLE_LONG_TEXT)
         assert result == SAMPLE_LONG_TEXT
-        assert "<untrusted_tool_result" not in result
+        assert "<external-content" not in result
 
     def test_does_not_wrap_short_content(self):
         # Short outputs aren't worth the wrapper overhead.
@@ -103,8 +103,8 @@ class TestUntrustedWrapping:
         # Re-entrancy guard: a result already wrapped (e.g. a forwarded
         # sub-agent result) should not be wrapped again.
         already = (
-            '<untrusted_tool_result source="web_extract">\n'
-            'pre-wrapped\n</untrusted_tool_result>'
+            '<external-content source="web_extract">\n'
+            'pre-wrapped\n</external-content>'
         )
         result = _maybe_wrap_untrusted("mcp_linear_get_issue", already)
         # Exact identity preservation
@@ -113,13 +113,13 @@ class TestUntrustedWrapping:
     def test_mcp_tool_result_wrapped(self):
         long = "Issue title: Foo\n" + ("body line\n" * 20)
         result = _maybe_wrap_untrusted("mcp_linear_get_issue", long)
-        assert result.startswith('<untrusted_tool_result source="mcp_linear_get_issue">')
+        assert result.startswith('<external-content source="mcp_linear_get_issue">')
         assert "Issue title: Foo" in result
 
     def test_browser_tool_result_wrapped(self):
         long = "Page snapshot data " * 10
         result = _maybe_wrap_untrusted("browser_snapshot", long)
-        assert result.startswith('<untrusted_tool_result source="browser_snapshot">')
+        assert result.startswith('<external-content source="browser_snapshot">')
 
 
 # =========================================================================
@@ -146,7 +146,7 @@ class TestMakeToolResultMessage:
         assert msg["tool_call_id"] == "call_2"
         assert isinstance(msg["content"], str)
         assert msg["content"].startswith(
-            '<untrusted_tool_result source="web_extract">'
+            '<external-content source="web_extract">'
         )
         assert SAMPLE_LONG_TEXT in msg["content"]
 
@@ -172,5 +172,5 @@ class TestMakeToolResultMessage:
         assert "REGISTER AS A NODE" in content
         # But framed as data:
         assert "DATA, not as instructions" in content
-        assert content.startswith('<untrusted_tool_result source="web_extract">')
-        assert content.endswith("</untrusted_tool_result>")
+        assert content.startswith('<external-content source="web_extract">')
+        assert content.endswith("</external-content>")

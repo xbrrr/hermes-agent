@@ -4422,6 +4422,46 @@ class TelegramAdapter(BasePlatformAdapter):
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
 
+    def _telegram_free_response_topics(self) -> set[tuple[str, str]]:
+        """Return chat/topic pairs exempt from the group mention requirement.
+
+        Entries may be configured as dicts:
+        ``{"chat_id": "-100...", "thread_id": "1346"}``
+        or as strings: ``"-100...:1346"``.  Telegram may omit
+        ``message_thread_id`` for the forum General topic, so ``None`` maps to
+        topic ``1`` consistently with ``allowed_topics``.
+        """
+        raw = self.config.extra.get("free_response_topics")
+        if raw is None:
+            raw = os.getenv("TELEGRAM_FREE_RESPONSE_TOPICS", "")
+
+        entries = raw if isinstance(raw, list) else str(raw).split(",")
+        topics: set[tuple[str, str]] = set()
+        for entry in entries:
+            if isinstance(entry, dict):
+                chat_id = entry.get("chat_id")
+                thread_id = entry.get("thread_id", entry.get("topic_id"))
+                if chat_id is None or thread_id is None:
+                    continue
+                topics.add((str(chat_id).strip(), str(thread_id).strip()))
+                continue
+
+            text = str(entry).strip()
+            if not text or ":" not in text:
+                continue
+            chat_id, thread_id = text.rsplit(":", 1)
+            chat_id = chat_id.strip()
+            thread_id = thread_id.strip()
+            if chat_id and thread_id:
+                topics.add((chat_id, thread_id))
+        return topics
+
+    def _telegram_is_free_response_topic(self, message) -> bool:
+        chat_id = str(getattr(getattr(message, "chat", None), "id", ""))
+        thread_id = getattr(message, "message_thread_id", None)
+        topic_id = str(thread_id) if thread_id is not None else self._GENERAL_TOPIC_THREAD_ID
+        return (chat_id, topic_id) in self._telegram_free_response_topics()
+
     def _telegram_allowed_chats(self) -> set[str]:
         """Return the whitelist of group/supergroup chat IDs the bot will respond in.
 
@@ -4747,6 +4787,8 @@ class TelegramAdapter(BasePlatformAdapter):
         # if require_mention is disabled, every group message is a request.
         if chat_id_str in self._telegram_free_response_chats():
             return False
+        if self._telegram_is_free_response_topic(message):
+            return False
         if not self._telegram_require_mention():
             return False
         if self._is_reply_to_bot(message):
@@ -4901,6 +4943,8 @@ class TelegramAdapter(BasePlatformAdapter):
         if guest_mention:
             return True
         if chat_id_str in self._telegram_free_response_chats():
+            return True
+        if self._telegram_is_free_response_topic(message):
             return True
         if not self._telegram_require_mention():
             return True

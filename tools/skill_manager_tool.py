@@ -937,6 +937,10 @@ SKILL_MANAGE_SCHEMA = {
                 "enum": ["create", "patch", "edit", "delete", "write_file", "remove_file"],
                 "description": "The action to perform."
             },
+            "idempotency_key": {
+                "type": "string",
+                "description": "Optional duplicate-suppression key for side-effecting skill changes. Reusing the same key within 300 seconds returns the cached result instead of applying the change again."
+            },
             "name": {
                 "type": "string",
                 "description": (
