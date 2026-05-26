@@ -1721,7 +1721,9 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
 
     description = (
         "Run a Python script that can call Hermes tools programmatically. "
-        "Use this when you need 3+ tool calls with processing logic between them, "
+        "Trigger phrase: multi-step scenarios / 3+ sequential tool calls should usually use "
+        "one execute_code script with `from hermes_tools import ...` instead of separate "
+        "round-trips. Use this when you need 3+ tool calls with processing logic between them, "
         "need to filter/reduce large tool outputs before they enter your context, "
         "need conditional branching (if X then Y else Z), or need to loop "
         "(fetch N pages, process N files, retry on failure).\n\n"

@@ -67,6 +67,22 @@ _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 
+_GATEWAY_MULTI_STEP_CODE_AS_ACTION_HINT = (
+    "Gateway code-as-action hint: For multi-step tasks (3+ sequential tool calls), "
+    "prefer writing a single Python script using execute_code with hermes_tools imports. "
+    "This reduces round-trips and context overhead. Example: "
+    "`from hermes_tools import search_files, read_file, write_file; ...; print(summary)`."
+)
+
+
+def _append_gateway_code_as_action_hint(prompt: str) -> str:
+    """Append the gateway-only code-as-action hint idempotently."""
+    base = (prompt or "").strip()
+    if _GATEWAY_MULTI_STEP_CODE_AS_ACTION_HINT in base:
+        return base
+    return (base + "\n\n" + _GATEWAY_MULTI_STEP_CODE_AS_ACTION_HINT).strip()
+
+
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"("  # transient/auxiliary status that should stay in logs, not Telegram chat
     r"auxiliary\s+.+\s+failed"
@@ -16441,6 +16457,7 @@ class GatewayRunner:
                 combined_ephemeral = (combined_ephemeral + "\n\n" + event_channel_prompt).strip()
             if self._ephemeral_system_prompt:
                 combined_ephemeral = (combined_ephemeral + "\n\n" + self._ephemeral_system_prompt).strip()
+            combined_ephemeral = _append_gateway_code_as_action_hint(combined_ephemeral)
 
             # Re-read .env and config for fresh credentials (gateway is long-lived,
             # keys may change without restart). Keep config.yaml authoritative for

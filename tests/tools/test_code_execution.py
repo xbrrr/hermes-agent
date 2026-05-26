@@ -651,6 +651,13 @@ class TestBuildExecuteCodeSchema(unittest.TestCase):
         self.assertIn("50KB", desc)
         self.assertIn("50 tool calls", desc)
 
+    def test_description_mentions_multi_step_trigger_phrase(self):
+        schema = build_execute_code_schema()
+        desc = schema["description"]
+        self.assertIn("multi-step scenarios", desc)
+        self.assertIn("3+ sequential tool calls", desc)
+        self.assertIn("from hermes_tools import", desc)
+
     def test_description_mentions_helpers(self):
         schema = build_execute_code_schema()
         desc = schema["description"]
