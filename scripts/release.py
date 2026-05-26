@@ -1317,6 +1317,15 @@ AUTHOR_MAP = {
     "dearmayo@localhost": "ffr31mr",  # PR #32103 (SubdirectoryHintTracker workspace boundary)
     "TheOnlyMika@users.noreply.github.com": "TheOnlyMika",  # PR #32155 (dashboard XSS + defusedxml)
     "krislidimo@gmail.com": "krislidimo",  # PR #29775 (tighten Telegram table row-group spacing; drop redundant first bullet)
+    "baxter@bitreserve.ai": "BaxBit",  # PR #30200 (Svix webhook signature validation)
+    "glen@workmanfirearms.com": "sgtworkman",  # PR #24889 (cron API provenance logging)
+    "jiahuigu@sjtu.edu.cn": "Jiahui-Gu",  # PR #29276 (darwinian-evolver pickle guard)
+    "jorge.fuenmayort@gmail.com": "jfuenmayor",  # PR #31229 (skill trust matching hardening)
+    "peter.yuqin@gmail.com": "WuKongAI-CMU",  # PR #10082/#10133 (symlink input hardening)
+    "roadhero@users.noreply.github.com": "roadhero",  # PR #27794 (env passthrough hardening)
+    "rodrigoeq@hotmail.com": "rodrigoeqnit",  # PR #23835 (approval security hardening)
+    "weichangyuwcy@gmail.com": "ChyuWei",  # PR #30987 (TUI voice/TTS state)
+    "xbr@Mac-mini-Mike.local": "xbrrr",  # Local Agentic Stack commits
 }
 
 
