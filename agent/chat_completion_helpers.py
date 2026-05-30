@@ -660,6 +660,27 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
         provider_name=agent.provider,
     )
 
+_TOOL_TURN_SCRATCH_RE = re.compile(
+    r"^(?:Need|I need to|We need to|Need to)\b.*\b(?:tool|memory|verify|check|run|patch|script|reset|user|maybe)\b",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _looks_like_internal_tool_scratch(content: str) -> bool:
+    """Detect untagged planning text leaked into a tool-call turn.
+
+    Codex Responses can occasionally put a short planning note in the visible
+    ``content`` field while also returning tool calls.  That text is not a
+    user-facing answer; storing it as assistant content pollutes Telegram/session
+    history.  Keep the heuristic narrow so ordinary assistant content remains
+    untouched.
+    """
+    if not isinstance(content, str):
+        return False
+    stripped = content.strip()
+    if not stripped or len(stripped) > 800:
+        return False
+    return bool(_TOOL_TURN_SCRATCH_RE.match(stripped))
 
 
 def build_assistant_message(agent, assistant_message, finish_reason: str) -> dict:
@@ -731,6 +752,13 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
     if isinstance(_san_content, str) and _san_content:
         from agent.redact import redact_sensitive_text
         _san_content = redact_sensitive_text(_san_content)
+
+    if assistant_tool_calls and _looks_like_internal_tool_scratch(_san_content):
+        if reasoning_text:
+            reasoning_text = f"{reasoning_text}\n\n{_san_content}"
+        else:
+            reasoning_text = _san_content
+        _san_content = ""
 
     msg = {
         "role": "assistant",
@@ -941,7 +969,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     # raw_codex=True because the main agent needs direct responses.stream()
     # access for Codex providers.
     try:
-        from agent.auxiliary_client import resolve_provider_client
+        from agent.auxiliary_client import AnthropicAuxiliaryClient, resolve_provider_client
         # Pass base_url and api_key from fallback config so custom
         # endpoints (e.g. Ollama Cloud) resolve correctly instead of
         # falling through to OpenRouter defaults.
@@ -958,10 +986,12 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # (not substring) — see GHSA-76xc-57q6-vm5m.
         if fb_base_url_hint and base_url_host_matches(fb_base_url_hint, "ollama.com") and not fb_api_key_hint:
             fb_api_key_hint = os.getenv("OLLAMA_API_KEY") or None
+        fb_api_mode_hint = (fb.get("api_mode") or fb.get("transport") or "").strip() or None
         fb_client, _resolved_fb_model = resolve_provider_client(
             fb_provider, model=fb_model, raw_codex=True,
             explicit_base_url=fb_base_url_hint,
-            explicit_api_key=fb_api_key_hint)
+            explicit_api_key=fb_api_key_hint,
+            api_mode=fb_api_mode_hint)
         if fb_client is None:
             logger.warning(
                 "Fallback to %s failed: provider not configured",
@@ -978,10 +1008,12 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             )
 
         # Determine api_mode from provider / base URL / model
-        fb_api_mode = "chat_completions"
+        fb_api_mode = fb_api_mode_hint or "chat_completions"
         fb_base_url = str(fb_client.base_url)
         _fb_is_azure = agent._is_azure_openai_url(fb_base_url)
-        if fb_provider == "openai-codex":
+        if isinstance(fb_client, AnthropicAuxiliaryClient):
+            fb_api_mode = "anthropic_messages"
+        elif fb_provider == "openai-codex":
             fb_api_mode = "codex_responses"
         elif fb_provider == "anthropic" or fb_base_url.rstrip("/").lower().endswith("/anthropic"):
             fb_api_mode = "anthropic_messages"

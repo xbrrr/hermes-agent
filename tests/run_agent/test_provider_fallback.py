@@ -182,6 +182,115 @@ class TestFallbackChainAdvancement:
             assert agent._try_activate_fallback() is True
             assert mock_rpc.call_args.kwargs["explicit_api_key"] == "env-secret"
 
+    def test_named_custom_anthropic_wrapper_keeps_anthropic_api_mode(self):
+        """Named custom providers may declare api_mode in custom_providers.
+
+        Fallback activation must preserve that resolved transport instead of
+        re-inferring from a plain localhost base_url and dropping to
+        chat_completions.
+        """
+        from agent.auxiliary_client import AnthropicAuxiliaryClient
+
+        fbs = [
+            {"provider": "custom:meridian-claude-max", "model": "claude-sonnet-4-6"}
+        ]
+        agent = _make_agent(fallback_model=fbs)
+        resolved_client = AnthropicAuxiliaryClient(
+            MagicMock(),
+            "claude-sonnet-4-6",
+            "meridian-local",
+            "http://127.0.0.1:3456",
+            is_oauth=False,
+        )
+
+        with (
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(resolved_client, "claude-sonnet-4-6"),
+            ) as mock_rpc,
+            patch("agent.anthropic_adapter.build_anthropic_client", return_value=MagicMock()),
+        ):
+            assert agent._try_activate_fallback() is True
+
+        assert mock_rpc.call_args.kwargs["api_mode"] is None
+        assert agent.api_mode == "anthropic_messages"
+        assert agent.base_url == "http://127.0.0.1:3456"
+        assert agent.client is None
+        assert agent._anthropic_client is not None
+
+    def test_explicit_fallback_api_mode_is_forwarded_to_resolver(self):
+        fbs = [
+            {
+                "provider": "custom",
+                "model": "claude-sonnet-4-6",
+                "base_url": "http://127.0.0.1:3456",
+                "api_mode": "anthropic_messages",
+            }
+        ]
+        agent = _make_agent(fallback_model=fbs)
+        mock_client = _mock_client(
+            base_url="http://127.0.0.1:3456",
+            api_key="meridian-local",
+        )
+
+        with (
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(mock_client, "claude-sonnet-4-6"),
+            ) as mock_rpc,
+            patch("agent.anthropic_adapter.build_anthropic_client", return_value=MagicMock()),
+        ):
+            assert agent._try_activate_fallback() is True
+
+        assert mock_rpc.call_args.kwargs["api_mode"] == "anthropic_messages"
+        assert agent.api_mode == "anthropic_messages"
+
+    def test_named_custom_fallback_inherits_configured_transport_and_credentials(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        (hermes_home / "config.yaml").write_text(
+            "\n".join(
+                [
+                    "model:",
+                    "  default: primary-model",
+                    "  provider: anthropic",
+                    "custom_providers:",
+                    "  - name: meridian-claude-max",
+                    "    base_url: http://127.0.0.1:3456",
+                    "    api_key: meridian-local-key",
+                    "    api_mode: anthropic_messages",
+                    "    model: config-default-claude",
+                    "",
+                ]
+            )
+        )
+
+        fbs = [
+            {"provider": "custom:meridian-claude-max", "model": "claude-sonnet-4-6"}
+        ]
+        agent = _make_agent(fallback_model=fbs)
+
+        with patch(
+            "agent.anthropic_adapter.build_anthropic_client",
+            return_value=MagicMock(),
+        ) as mock_build:
+            assert agent._try_activate_fallback() is True
+
+        assert agent.provider == "custom:meridian-claude-max"
+        assert agent.model == "claude-sonnet-4-6"
+        assert agent.base_url == "http://127.0.0.1:3456"
+        assert agent.api_key == "meridian-local-key"
+        assert agent.api_mode == "anthropic_messages"
+        assert agent.client is None
+        assert agent._anthropic_client is not None
+        assert any(
+            call.args[:2] == ("meridian-local-key", "http://127.0.0.1:3456")
+            for call in mock_build.call_args_list
+        )
+
 
 # ── Pool-rotation vs fallback gating (#11314) ────────────────────────────
 

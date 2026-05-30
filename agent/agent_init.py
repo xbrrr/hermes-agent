@@ -747,7 +747,7 @@ def init_agent(
                     pass
         else:
             # No explicit creds — use the centralized provider router
-            from agent.auxiliary_client import resolve_provider_client
+            from agent.auxiliary_client import AnthropicAuxiliaryClient, resolve_provider_client
             _routed_client, _ = resolve_provider_client(
                 agent.provider or "auto", model=agent.model, raw_codex=True)
             if _routed_client is not None:
@@ -755,6 +755,8 @@ def init_agent(
                     "api_key": _routed_client.api_key,
                     "base_url": str(_routed_client.base_url),
                 }
+                if isinstance(_routed_client, AnthropicAuxiliaryClient):
+                    client_kwargs["_anthropic_real_client"] = _routed_client._real_client
                 if _provider_timeout is not None:
                     client_kwargs["timeout"] = _provider_timeout
                 # Preserve provider-specific headers the router set.  The
@@ -803,6 +805,7 @@ def init_agent(
                             _fb["provider"], model=_fb["model"], raw_codex=True,
                             explicit_base_url=_fb.get("base_url"),
                             explicit_api_key=_fb_explicit_key,
+                            api_mode=(_fb.get("api_mode") or _fb.get("transport") or None),
                         )
                         if _fb_client is not None:
                             agent.provider = _fb["provider"]
@@ -812,6 +815,8 @@ def init_agent(
                                 "api_key": _fb_client.api_key,
                                 "base_url": str(_fb_client.base_url),
                             }
+                            if isinstance(_fb_client, AnthropicAuxiliaryClient):
+                                client_kwargs["_anthropic_real_client"] = _fb_client._real_client
                             if _provider_timeout is not None:
                                 client_kwargs["timeout"] = _provider_timeout
                             _fb_headers = getattr(_fb_client, "_custom_headers", None)
@@ -835,6 +840,7 @@ def init_agent(
                         "configuration."
                     )
         
+        _anthropic_real_client = client_kwargs.pop("_anthropic_real_client", None)
         agent._client_kwargs = client_kwargs  # stored for rebuilding after interrupt
 
         # Enable fine-grained tool streaming for Claude on OpenRouter.
@@ -857,27 +863,36 @@ def init_agent(
 
         agent.api_key = client_kwargs.get("api_key", "")
         agent.base_url = client_kwargs.get("base_url", agent.base_url)
-        try:
-            agent.client = agent._create_openai_client(client_kwargs, reason="agent_init", shared=True)
-            if not agent.quiet_mode:
-                print(f"🤖 AI Agent initialized with model: {agent.model}")
-                if base_url:
-                    print(f"🔗 Using custom base URL: {base_url}")
-                # ``api_key`` may be a callable Entra ID bearer
-                # provider (Azure Foundry). The OpenAI SDK mints a
-                # fresh JWT per request internally — the banner
-                # never invokes or inspects the callable.
-                from agent.azure_identity_adapter import is_token_provider
+        if _anthropic_real_client is not None:
+            agent.api_mode = "anthropic_messages"
+            agent._anthropic_api_key = agent.api_key
+            agent._anthropic_base_url = agent.base_url
+            agent._anthropic_client = _anthropic_real_client
+            agent._is_anthropic_oauth = False
+            agent.client = None
+            agent._client_kwargs = {}
+        else:
+            try:
+                agent.client = agent._create_openai_client(client_kwargs, reason="agent_init", shared=True)
+                if not agent.quiet_mode:
+                    print(f"🤖 AI Agent initialized with model: {agent.model}")
+                    if base_url:
+                        print(f"🔗 Using custom base URL: {base_url}")
+                    # ``api_key`` may be a callable Entra ID bearer
+                    # provider (Azure Foundry). The OpenAI SDK mints a
+                    # fresh JWT per request internally — the banner
+                    # never invokes or inspects the callable.
+                    from agent.azure_identity_adapter import is_token_provider
 
-                key_used = client_kwargs.get("api_key", "none")
-                if is_token_provider(key_used):
-                    print("🔑 Using credentials: Microsoft Entra ID")
-                elif isinstance(key_used, str) and key_used and key_used != "dummy-key" and len(key_used) > 12:
-                    print(f"🔑 Using API key: {key_used[:8]}...{key_used[-4:]}")
-                else:
-                    print("⚠️  Warning: API key appears invalid or missing")
-        except Exception as e:
-            raise RuntimeError(f"Failed to initialize OpenAI client: {e}")
+                    key_used = client_kwargs.get("api_key", "none")
+                    if is_token_provider(key_used):
+                        print("🔑 Using credentials: Microsoft Entra ID")
+                    elif isinstance(key_used, str) and key_used and key_used != "dummy-key" and len(key_used) > 12:
+                        print(f"🔑 Using API key: {key_used[:8]}...{key_used[-4:]}")
+                    else:
+                        print("⚠️  Warning: API key appears invalid or missing")
+            except Exception as e:
+                raise RuntimeError(f"Failed to initialize OpenAI client: {e}")
     
     # Provider fallback chain — ordered list of backup providers tried
     # when the primary is exhausted (rate-limit, overload, connection

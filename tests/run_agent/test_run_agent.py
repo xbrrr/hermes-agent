@@ -1694,6 +1694,27 @@ class TestBuildAssistantMessage:
         assert len(result["tool_calls"]) == 1
         assert result["tool_calls"][0]["function"]["name"] == "web_search"
 
+    def test_tool_call_internal_scratch_not_stored_as_content(self, agent):
+        """Untagged planning text in a tool-call turn must not reach visible content."""
+        tc = _mock_tool_call(name="memory", arguments='{}', call_id="c1")
+        msg = _mock_assistant_msg(
+            content='Need update memory. Need maybe using memory replace.',
+            tool_calls=[tc],
+        )
+        result = agent._build_assistant_message(msg, "tool_calls")
+        assert result["content"] == ""
+        assert "Need update memory" in result["reasoning"]
+        assert len(result["tool_calls"]) == 1
+
+    def test_tool_call_normal_content_still_preserved(self, agent):
+        tc = _mock_tool_call(name="memory", arguments='{}', call_id="c1")
+        msg = _mock_assistant_msg(
+            content="Done — I will remember that preference.",
+            tool_calls=[tc],
+        )
+        result = agent._build_assistant_message(msg, "tool_calls")
+        assert result["content"] == "Done — I will remember that preference."
+
     def test_with_reasoning_details(self, agent):
         details = [{"type": "reasoning.summary", "text": "step1", "signature": "sig1"}]
         msg = _mock_assistant_msg(content="ans", reasoning_details=details)

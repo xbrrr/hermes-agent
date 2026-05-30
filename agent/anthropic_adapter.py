@@ -852,17 +852,65 @@ def _read_claude_code_credentials_from_keychain() -> Optional[Dict[str, Any]]:
     return None
 
 
-def read_claude_code_credentials() -> Optional[Dict[str, Any]]:
-    """Read refreshable Claude Code OAuth credentials.
+def _read_claude_code_setup_token_from_keychain() -> Optional[Dict[str, Any]]:
+    """Read the local Claude Code setup-token mirror from macOS Keychain.
 
-    Checks two sources in order:
+    ``claude setup-token`` can produce a long-lived ``sk-ant-oat`` token that is
+    intended to be supplied as ``CLAUDE_CODE_OAUTH_TOKEN`` and may not create
+    Claude Code's ordinary ``Claude Code-credentials`` keychain record.  On this
+    host we keep that token in the login Keychain under service
+    ``claude-code-oauth-token`` and account ``cheekalov@gmail.com`` so LaunchAgent
+    plists and shell env do not need to store the secret.
+    """
+    if platform.system() != "Darwin":
+        return None
+
+    try:
+        result = subprocess.run(
+            [
+                "security",
+                "find-generic-password",
+                "-w",
+                "-a",
+                "cheekalov@gmail.com",
+                "-s",
+                "claude-code-oauth-token",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        logger.debug("Keychain: setup-token lookup failed or timed out")
+        return None
+
+    if result.returncode != 0:
+        logger.debug("Keychain: no entry found for 'claude-code-oauth-token'")
+        return None
+
+    token = (result.stdout or "").strip()
+    if token.startswith("sk-ant-oat") or token.startswith("cc-"):
+        return {
+            "accessToken": token,
+            "refreshToken": "",
+            "expiresAt": 0,
+            "source": "macos_keychain_setup_token",
+        }
+    return None
+
+
+def read_claude_code_credentials() -> Optional[Dict[str, Any]]:
+    """Read Claude Code OAuth credentials.
+
+    Checks three sources in order:
       1. macOS Keychain (Darwin only) — "Claude Code-credentials" entry
-      2. ~/.claude/.credentials.json file
+      2. macOS Keychain setup-token mirror — service "claude-code-oauth-token"
+      3. ~/.claude/.credentials.json file
 
     This intentionally excludes ~/.claude.json primaryApiKey. Opencode's
-    subscription flow is OAuth/setup-token based with refreshable credentials,
-    and native direct Anthropic provider usage should follow that path rather
-    than auto-detecting Claude's first-party managed key.
+    subscription flow is OAuth/setup-token based, and native direct Anthropic
+    provider usage should follow that path rather than auto-detecting Claude's
+    first-party managed key.
 
     Returns dict with {accessToken, refreshToken?, expiresAt?} or None.
     """
@@ -870,6 +918,12 @@ def read_claude_code_credentials() -> Optional[Dict[str, Any]]:
     kc_creds = _read_claude_code_credentials_from_keychain()
     if kc_creds:
         return kc_creds
+
+    # Then try the local setup-token mirror. This keeps the token out of plist/env
+    # while still allowing Hermes' Anthropic resolver to use it at runtime.
+    setup_token_creds = _read_claude_code_setup_token_from_keychain()
+    if setup_token_creds:
+        return setup_token_creds
 
     # Fall back to JSON file
     cred_path = Path.home() / ".claude" / ".credentials.json"
