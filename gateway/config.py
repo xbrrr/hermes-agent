@@ -110,6 +110,36 @@ def _normalize_notice_delivery(value: Any, default: str = "public") -> str:
     return default
 
 
+def _normalize_stt_transcript_echo(value: Any, default: str = "on_request") -> str:
+    """Normalize STT transcript echo policy.
+
+    ``stt.enabled`` controls whether Hermes may listen to voice notes for the
+    agent.  This separate policy controls only the user-visible raw transcript
+    echo that is sent before the agent replies.
+    """
+    if isinstance(value, bool):
+        return "always" if value else "never"
+    if isinstance(value, str):
+        normalized = value.strip().lower().replace("-", "_")
+        aliases = {
+            "true": "always",
+            "yes": "always",
+            "on": "always",
+            "1": "always",
+            "false": "never",
+            "no": "never",
+            "off": "never",
+            "0": "never",
+            "request": "on_request",
+            "requested": "on_request",
+            "only_on_request": "on_request",
+        }
+        normalized = aliases.get(normalized, normalized)
+        if normalized in {"always", "on_request", "never"}:
+            return normalized
+    return default
+
+
 def _ensure_platform_extra_dict(platforms_data: dict, name: str) -> tuple[dict, dict]:
     """Get-or-create ``platforms_data[name]`` and its nested ``extra`` dict.
 
@@ -531,6 +561,7 @@ class GatewayConfig:
 
     # STT settings
     stt_enabled: bool = True  # Whether to auto-transcribe inbound voice messages
+    stt_transcript_echo: str = "on_request"  # "always", "on_request", or "never"
 
     # Session isolation in shared chats
     group_sessions_per_user: bool = True  # Isolate group/channel sessions per participant when user IDs are available
@@ -639,6 +670,7 @@ class GatewayConfig:
             "always_log_local": self.always_log_local,
             "filter_silence_narration": self.filter_silence_narration,
             "stt_enabled": self.stt_enabled,
+            "stt_transcript_echo": self.stt_transcript_echo,
             "group_sessions_per_user": self.group_sessions_per_user,
             "thread_sessions_per_user": self.thread_sessions_per_user,
             "max_concurrent_sessions": self.max_concurrent_sessions,
@@ -682,8 +714,15 @@ class GatewayConfig:
             quick_commands = {}
 
         stt_enabled = data.get("stt_enabled")
+        stt_transcript_echo = data.get("stt_transcript_echo")
         if stt_enabled is None:
             stt_enabled = data.get("stt", {}).get("enabled") if isinstance(data.get("stt"), dict) else None
+        if stt_transcript_echo is None and isinstance(data.get("stt"), dict):
+            stt_section = data.get("stt", {})
+            stt_transcript_echo = stt_section.get(
+                "transcript_echo",
+                stt_section.get("echo_transcripts"),
+            )
 
         group_sessions_per_user = data.get("group_sessions_per_user")
         thread_sessions_per_user = data.get("thread_sessions_per_user")
@@ -722,6 +761,7 @@ class GatewayConfig:
                 data.get("filter_silence_narration"), True
             ),
             stt_enabled=_coerce_bool(stt_enabled, True),
+            stt_transcript_echo=_normalize_stt_transcript_echo(stt_transcript_echo),
             group_sessions_per_user=_coerce_bool(group_sessions_per_user, True),
             thread_sessions_per_user=_coerce_bool(thread_sessions_per_user, False),
             max_concurrent_sessions=max_concurrent_sessions,

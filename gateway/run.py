@@ -7610,6 +7610,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         history = history or []
         message_text = event.text or ""
+        _original_message_text = message_text
         _group_sessions_per_user = getattr(self.config, "group_sessions_per_user", True)
         _thread_sessions_per_user = getattr(self.config, "thread_sessions_per_user", False)
         # Use the same helper every other call site uses so the write key here
@@ -7685,13 +7686,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     message_text,
                     audio_paths,
                 )
-                # Echo each successful transcript back to the user immediately,
-                # before the agent loop runs. Lets the user verify STT quality
-                # in real-time and see the raw whisper output verbatim.
+                # Echo successful transcripts back to the user only when the
+                # configured policy allows it. Hermes may still use STT
+                # internally so the agent can answer a voice note, but raw
+                # transcript spam in Telegram is opt-in/on-request.
                 if _successful_transcripts:
                     _echo_adapter = self.adapters.get(source.platform)
                     _echo_meta = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
-                    if _echo_adapter:
+                    if _echo_adapter and self._should_echo_voice_transcripts(event, _original_message_text):
                         for _tx in _successful_transcripts:
                             try:
                                 await _echo_adapter.send(
@@ -11671,6 +11673,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return prefix
         return user_text
 
+    def _should_echo_voice_transcripts(self, event: MessageEvent, user_text: str) -> bool:
+        """Return whether raw STT transcripts should be echoed to the user.
+
+        Voice STT itself can remain enabled so the agent can understand and
+        answer a voice note.  This policy only controls the separate immediate
+        `🎙️ "..."` echo message.
+        """
+        policy = str(getattr(self.config, "stt_transcript_echo", "on_request") or "on_request").lower()
+        if policy == "always":
+            return True
+        if policy == "never":
+            return False
+
+        request_text = " ".join(
+            part for part in [getattr(event, "text", "") or "", user_text or ""] if part
+        ).lower()
+        return bool(
+            re.search(
+                r"\b(transcribe|transcript|stt|whisper)\b|транскриб|расшифр|распознай|распознать|что\s+(?:я\s+)?сказал",
+                request_text,
+                flags=re.IGNORECASE,
+            )
+        )
+
     async def _enrich_message_with_transcription(
         self,
         user_text: str,
@@ -11691,7 +11717,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
               - ``successful_transcripts``: the raw transcript strings for audio
                 clips that were successfully transcribed, in input order. Empty
                 list if every clip failed or STT is disabled. Callers can use
-                this to echo transcripts back to the user before the agent loop.
+                this to echo transcripts back to the user when policy allows.
         """
         if not getattr(self.config, "stt_enabled", True):
             notes = []
@@ -11788,10 +11814,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         time never runs.
 
         This helper fills that gap: when the dequeued event has audio media,
-        we transcribe inline, echo the raw transcript back to the user (same
-        "🎙️" format as the fresh-message path), and return enriched text.
-        Non-audio events fall back to _build_media_placeholder, matching the
-        original _dequeue_pending_text behavior.
+        we transcribe inline, optionally echo the raw transcript back to the
+        user when policy allows, and return enriched text. Non-audio events fall
+        back to _build_media_placeholder, matching the original
+        _dequeue_pending_text behavior.
         """
         event = adapter.get_pending_message(session_key)
         if not event:
@@ -11815,12 +11841,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             enriched_text, successful_transcripts = await self._enrich_message_with_transcription(
                 text, audio_paths,
             )
-            # Echo raw transcripts back to the user so voice interrupts
-            # feel identical to fresh voice messages.
             if successful_transcripts:
                 echo_adapter = self.adapters.get(source.platform)
                 echo_meta = {"thread_id": source.thread_id} if source.thread_id else None
-                if echo_adapter:
+                if echo_adapter and self._should_echo_voice_transcripts(event, text):
                     for tx in successful_transcripts:
                         try:
                             await echo_adapter.send(
