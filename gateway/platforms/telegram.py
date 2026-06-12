@@ -4717,6 +4717,64 @@ class TelegramAdapter(BasePlatformAdapter):
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
 
+    def _telegram_free_response_topics(self) -> set[tuple[str, str]]:
+        """Return Telegram chat/topic pairs that bypass mention gating.
+
+        ``free_response_chats`` opens a whole group. Agentic Stack needs a
+        narrower forum-topic allowlist so MM can answer ordinary messages in
+        product topics while Server-doctor stays isolated. Entries may be
+        ``{"chat_id": "-100...", "thread_id": "259"}``, ``[-100, 259]``,
+        or ``"-100:259"``. Missing Telegram thread id maps to General topic
+        ``1`` for parity with ``allowed_topics``.
+        """
+        raw = self.config.extra.get("free_response_topics")
+        if raw is None:
+            env_raw = os.getenv("TELEGRAM_FREE_RESPONSE_TOPICS", "").strip()
+            if not env_raw:
+                return set()
+            try:
+                raw = json.loads(env_raw)
+            except Exception:
+                raw = [part.strip() for part in env_raw.split(",") if part.strip()]
+
+        if isinstance(raw, (str, int)):
+            values = [raw]
+        elif isinstance(raw, list):
+            values = raw
+        else:
+            logger.warning("[%s] telegram free_response_topics must be a list/string; got %s", self.name, type(raw).__name__)
+            return set()
+
+        topics: set[tuple[str, str]] = set()
+        for item in values:
+            chat_id = thread_id = None
+            if isinstance(item, dict):
+                chat_id = item.get("chat_id") or item.get("chat")
+                thread_id = item.get("thread_id") or item.get("topic_id") or item.get("message_thread_id")
+            elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                chat_id, thread_id = item[0], item[1]
+            else:
+                text = str(item).strip()
+                if ":" in text:
+                    chat_id, thread_id = text.rsplit(":", 1)
+            if chat_id is None or thread_id is None:
+                logger.warning("[%s] Ignoring invalid Telegram free_response_topics entry: %r", self.name, item)
+                continue
+            chat_text = str(chat_id).strip()
+            thread_text = str(thread_id).strip() or self._GENERAL_TOPIC_THREAD_ID
+            if chat_text and thread_text:
+                topics.add((chat_text, thread_text))
+        return topics
+
+    def _telegram_message_in_free_response_topic(self, message: Any) -> bool:
+        topics = self._telegram_free_response_topics()
+        if not topics:
+            return False
+        chat_id = str(getattr(getattr(message, "chat", None), "id", ""))
+        thread_id = getattr(message, "message_thread_id", None)
+        topic_id = str(thread_id) if thread_id is not None else self._GENERAL_TOPIC_THREAD_ID
+        return (chat_id, topic_id) in topics
+
     def _telegram_allowed_chats(self) -> set[str]:
         """Return the whitelist of group/supergroup chat IDs the bot will respond in.
 
@@ -5040,7 +5098,7 @@ class TelegramAdapter(BasePlatformAdapter):
         # Only observe messages skipped by the require_mention gate.  If the
         # message would be processed normally, let the dispatcher handle it;
         # if require_mention is disabled, every group message is a request.
-        if chat_id_str in self._telegram_free_response_chats():
+        if chat_id_str in self._telegram_free_response_chats() or self._telegram_message_in_free_response_topic(message):
             return False
         if not self._telegram_require_mention():
             return False
@@ -5291,7 +5349,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
         if guest_mention:
             return True
-        if chat_id_str in self._telegram_free_response_chats():
+        if chat_id_str in self._telegram_free_response_chats() or self._telegram_message_in_free_response_topic(message):
             return True
         if not self._telegram_require_mention():
             return True
