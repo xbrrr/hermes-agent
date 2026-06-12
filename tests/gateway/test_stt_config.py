@@ -16,6 +16,16 @@ def test_gateway_config_stt_disabled_from_dict_nested():
     assert config.stt_enabled is False
 
 
+def test_gateway_config_stt_transcript_echo_defaults_to_on_request():
+    config = GatewayConfig.from_dict({"stt": {"enabled": True}})
+    assert config.stt_transcript_echo == "on_request"
+
+
+def test_gateway_config_stt_transcript_echo_accepts_legacy_bool():
+    assert GatewayConfig.from_dict({"stt": {"echo_transcripts": True}}).stt_transcript_echo == "always"
+    assert GatewayConfig.from_dict({"stt": {"echo_transcripts": False}}).stt_transcript_echo == "never"
+
+
 def test_load_gateway_config_bridges_stt_enabled_from_config_yaml(tmp_path, monkeypatch):
     hermes_home = tmp_path / ".hermes"
     hermes_home.mkdir()
@@ -47,7 +57,7 @@ async def test_enrich_message_with_transcription_surfaces_path_when_stt_disabled
         "gateway.run._probe_audio_duration",
         new=AsyncMock(return_value="0:12"),
     ):
-        result = await runner._enrich_message_with_transcription(
+        result, transcripts = await runner._enrich_message_with_transcription(
             "caption",
             ["/tmp/voice.ogg"],
         )
@@ -56,6 +66,7 @@ async def test_enrich_message_with_transcription_surfaces_path_when_stt_disabled
     assert "voice message" in result.lower()
     assert "(duration: 0:12)" in result
     assert "caption" in result
+    assert transcripts == []
 
 
 @pytest.mark.asyncio
@@ -69,13 +80,14 @@ async def test_enrich_message_with_transcription_omits_duration_on_probe_failure
         "gateway.run._probe_audio_duration",
         new=AsyncMock(return_value=None),
     ):
-        result = await runner._enrich_message_with_transcription(
+        result, transcripts = await runner._enrich_message_with_transcription(
             "",
             ["/tmp/voice.ogg"],
         )
 
     assert "/tmp/voice.ogg" in result
     assert "duration" not in result.lower()
+    assert transcripts == []
 
 
 @pytest.mark.asyncio
@@ -89,7 +101,7 @@ async def test_enrich_message_with_transcription_avoids_bogus_no_provider_messag
         "tools.transcription_tools.transcribe_audio",
         return_value={"success": False, "error": "VOICE_TOOLS_OPENAI_KEY not set"},
     ):
-        result = await runner._enrich_message_with_transcription(
+        result, transcripts = await runner._enrich_message_with_transcription(
             "caption",
             ["/tmp/voice.ogg"],
         )
@@ -97,6 +109,7 @@ async def test_enrich_message_with_transcription_avoids_bogus_no_provider_messag
     assert "No STT provider is configured" not in result
     assert "trouble transcribing" in result
     assert "caption" in result
+    assert transcripts == []
 
 
 @pytest.mark.asyncio
@@ -140,3 +153,66 @@ async def test_prepare_inbound_message_text_transcribes_queued_voice_event():
     assert result is not None
     assert "queued voice transcript" in result
     assert "voice message" in result.lower()
+
+
+@pytest.mark.asyncio
+async def test_prepare_inbound_voice_does_not_echo_transcript_by_default():
+    from gateway.run import GatewayRunner
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.config = GatewayConfig(stt_enabled=True)
+    adapter = AsyncMock()
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._model = "test-model"
+    runner._base_url = ""
+    runner._has_setup_skill = lambda: False
+
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="123", chat_type="dm")
+    event = MessageEvent(
+        text="",
+        message_type=MessageType.VOICE,
+        source=source,
+        media_urls=["/tmp/voice.ogg"],
+        media_types=["audio/ogg"],
+    )
+
+    with patch(
+        "tools.transcription_tools.transcribe_audio",
+        return_value={"success": True, "transcript": "raw transcript", "provider": "local_command"},
+    ):
+        result = await runner._prepare_inbound_message_text(event=event, source=source, history=[])
+
+    assert "raw transcript" in result
+    adapter.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_prepare_inbound_voice_echoes_transcript_when_requested():
+    from gateway.run import GatewayRunner
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.config = GatewayConfig(stt_enabled=True)
+    adapter = AsyncMock()
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._model = "test-model"
+    runner._base_url = ""
+    runner._has_setup_skill = lambda: False
+
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="123", chat_type="dm")
+    event = MessageEvent(
+        text="расшифруй",
+        message_type=MessageType.VOICE,
+        source=source,
+        media_urls=["/tmp/voice.ogg"],
+        media_types=["audio/ogg"],
+    )
+
+    with patch(
+        "tools.transcription_tools.transcribe_audio",
+        return_value={"success": True, "transcript": "raw transcript", "provider": "local_command"},
+    ):
+        result = await runner._prepare_inbound_message_text(event=event, source=source, history=[])
+
+    assert "raw transcript" in result
+    adapter.send.assert_awaited_once()
+    assert '🎙️ "raw transcript"' in adapter.send.await_args.args[1]

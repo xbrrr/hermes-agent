@@ -7848,6 +7848,7 @@ class GatewayRunner:
         """
         history = history or []
         message_text = event.text or ""
+        _original_message_text = message_text
         _group_sessions_per_user = getattr(self.config, "group_sessions_per_user", True)
         _thread_sessions_per_user = getattr(self.config, "thread_sessions_per_user", False)
         # Use the same helper every other call site uses so the write key here
@@ -7919,10 +7920,29 @@ class GatewayRunner:
                     )
 
             if audio_paths:
-                message_text = await self._enrich_message_with_transcription(
+                message_text, _successful_transcripts = await self._enrich_message_with_transcription(
                     message_text,
                     audio_paths,
                 )
+                # Echo successful transcripts back to the user only when the
+                # configured policy allows it. Hermes may still use STT
+                # internally so the agent can answer a voice note, but raw
+                # transcript spam in Telegram is opt-in/on-request.
+                if _successful_transcripts:
+                    _echo_adapter = self.adapters.get(source.platform)
+                    _echo_meta = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
+                    if _echo_adapter and self._should_echo_voice_transcripts(event, _original_message_text):
+                        for _tx in _successful_transcripts:
+                            try:
+                                await _echo_adapter.send(
+                                    source.chat_id,
+                                    f'🎙️ "{_tx}"',
+                                    metadata=_echo_meta,
+                                )
+                            except Exception as _echo_exc:
+                                logger.debug(
+                                    "Transcript echo failed (non-fatal): %s", _echo_exc,
+                                )
                 _stt_fail_markers = (
                     "No STT provider",
                     "STT is disabled",
@@ -14585,11 +14605,35 @@ class GatewayRunner:
             return prefix
         return user_text
 
+    def _should_echo_voice_transcripts(self, event: MessageEvent, user_text: str) -> bool:
+        """Return whether raw STT transcripts should be echoed to the user.
+
+        Voice STT itself can remain enabled so the agent can understand and
+        answer a voice note.  This policy only controls the separate immediate
+        `🎙️ "..."` echo message.
+        """
+        policy = str(getattr(self.config, "stt_transcript_echo", "on_request") or "on_request").lower()
+        if policy == "always":
+            return True
+        if policy == "never":
+            return False
+
+        request_text = " ".join(
+            part for part in [getattr(event, "text", "") or "", user_text or ""] if part
+        ).lower()
+        return bool(
+            re.search(
+                r"\b(transcribe|transcript|stt|whisper)\b|транскриб|расшифр|распознай|распознать|что\s+(?:я\s+)?сказал",
+                request_text,
+                flags=re.IGNORECASE,
+            )
+        )
+
     async def _enrich_message_with_transcription(
         self,
         user_text: str,
         audio_paths: List[str],
-    ) -> str:
+    ) -> tuple[str, List[str]]:
         """
         Auto-transcribe user voice/audio messages using the configured STT provider
         and prepend the transcript to the message text.
@@ -14599,7 +14643,7 @@ class GatewayRunner:
             audio_paths: List of local file paths to cached audio files.
 
         Returns:
-            The enriched message string with transcriptions prepended.
+            A tuple of the enriched message string plus successful raw transcripts.
         """
         if not getattr(self.config, "stt_enabled", True):
             notes = []
@@ -14613,24 +14657,26 @@ class GatewayRunner:
                 else:
                     notes.append(f"[The user sent a voice message: {abs_path}]")
             if not notes:
-                return user_text
+                return user_text, []
             prefix = "\n\n".join(notes)
             _placeholder = "(The user sent a message with no text content)"
             if user_text and user_text.strip() == _placeholder:
-                return prefix
+                return prefix, []
             if user_text:
-                return f"{prefix}\n\n{user_text}"
-            return prefix
+                return f"{prefix}\n\n{user_text}", []
+            return prefix, []
 
         from tools.transcription_tools import transcribe_audio
 
         enriched_parts = []
+        transcripts: List[str] = []
         for path in audio_paths:
             try:
                 logger.debug("Transcribing user voice: %s", path)
                 result = await asyncio.to_thread(transcribe_audio, path)
                 if result["success"]:
                     transcript = result["transcript"]
+                    transcripts.append(transcript)
                     enriched_parts.append(
                         f'[The user sent a voice message~ '
                         f'Here\'s what they said: "{transcript}"]'
@@ -14673,11 +14719,11 @@ class GatewayRunner:
             # when we successfully transcribed the audio — it's redundant.
             _placeholder = "(The user sent a message with no text content)"
             if user_text and user_text.strip() == _placeholder:
-                return prefix
+                return prefix, transcripts
             if user_text:
-                return f"{prefix}\n\n{user_text}"
-            return prefix
-        return user_text
+                return f"{prefix}\n\n{user_text}", transcripts
+            return prefix, transcripts
+        return user_text, transcripts
 
     def _build_process_event_source(self, evt: dict):
         """Resolve the canonical source for a synthetic background-process event.
