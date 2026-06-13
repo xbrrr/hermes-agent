@@ -364,6 +364,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self._mention_patterns = self._compile_mention_patterns()
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
         self._disable_link_previews: bool = self._coerce_bool_extra("disable_link_previews", False)
+        self._plain_text_responses: bool = self._coerce_bool_extra("plain_text_responses", False)
         # Bot API 10.1 Rich Messages: render constructs the legacy MarkdownV2
         # path degrades (tables → bullet lists, task lists, <details>, block
         # math) via sendRichMessage / editMessageText's rich_message param using
@@ -382,7 +383,7 @@ class TelegramAdapter(BasePlatformAdapter):
         # Latched off after a capability failure on sendRichMessage /
         # sendRichMessageDraft (e.g. older python-telegram-bot without the
         # endpoint) so later sends skip the doomed rich attempt entirely.
-        self._rich_send_disabled: bool = False
+        self._rich_send_disabled: bool = self._coerce_bool_extra("disable_rich_messages", False)
         self._rich_draft_disabled: bool = False
         # Buffer rapid/album photo updates so Telegram image bursts are handled
         # as a single MessageEvent instead of self-interrupting multiple turns.
@@ -1073,6 +1074,8 @@ class TelegramAdapter(BasePlatformAdapter):
         FINAL edit should still upgrade to rich when the content warrants it.
         """
         return bool(
+            not getattr(self, "_plain_text_responses", False)
+            and
             self._rich_delivery_enabled(content)
             and not getattr(self, "_rich_send_disabled", False)
             and content
@@ -2639,7 +2642,8 @@ class TelegramAdapter(BasePlatformAdapter):
                     return rich_result
 
             # Format and split message if needed
-            formatted = self.format_message(content)
+            plain_text_responses = getattr(self, "_plain_text_responses", False)
+            formatted = content if plain_text_responses else self.format_message(content)
             chunks = self.truncate_message(
                 formatted, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len,
             )
@@ -2720,33 +2724,44 @@ class TelegramAdapter(BasePlatformAdapter):
                 msg = None
                 for _send_attempt in range(3):
                     try:
-                        # Try Markdown first, fall back to plain text if it fails
-                        try:
+                        if plain_text_responses:
                             msg = await self._bot.send_message(
                                 chat_id=normalize_telegram_chat_id(chat_id),
                                 text=chunk,
-                                parse_mode=ParseMode.MARKDOWN_V2,
+                                parse_mode=None,
                                 reply_to_message_id=reply_to_id,
                                 **thread_kwargs,
                                 **self._link_preview_kwargs(),
                                 **self._notification_kwargs(metadata),
                             )
-                        except Exception as md_error:
-                            # Markdown parsing failed, try plain text
-                            if "parse" in str(md_error).lower() or "markdown" in str(md_error).lower():
-                                logger.warning("[%s] MarkdownV2 parse failed, falling back to plain text: %s", self.name, md_error)
-                                plain_chunk = _strip_mdv2(chunk)
+                        else:
+                            # Try Markdown first, fall back to plain text if it fails
+                            try:
                                 msg = await self._bot.send_message(
                                     chat_id=normalize_telegram_chat_id(chat_id),
-                                    text=plain_chunk,
-                                    parse_mode=None,
+                                    text=chunk,
+                                    parse_mode=ParseMode.MARKDOWN_V2,
                                     reply_to_message_id=reply_to_id,
                                     **thread_kwargs,
                                     **self._link_preview_kwargs(),
                                     **self._notification_kwargs(metadata),
                                 )
-                            else:
-                                raise
+                            except Exception as md_error:
+                                # Markdown parsing failed, try plain text
+                                if "parse" in str(md_error).lower() or "markdown" in str(md_error).lower():
+                                    logger.warning("[%s] MarkdownV2 parse failed, falling back to plain text: %s", self.name, md_error)
+                                    plain_chunk = _strip_mdv2(chunk)
+                                    msg = await self._bot.send_message(
+                                        chat_id=normalize_telegram_chat_id(chat_id),
+                                        text=plain_chunk,
+                                        parse_mode=None,
+                                        reply_to_message_id=reply_to_id,
+                                        **thread_kwargs,
+                                        **self._link_preview_kwargs(),
+                                        **self._notification_kwargs(metadata),
+                                    )
+                                else:
+                                    raise
                         break  # success
                     except _NetErr as send_err:
                         # BadRequest is a subclass of NetworkError in
