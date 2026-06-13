@@ -161,6 +161,22 @@ def _bot_command_entity(text, command):
     return SimpleNamespace(type="bot_command", offset=offset, length=len(command))
 
 
+def test_addressed_slash_command_keeps_argument_separator_when_cleaned():
+    adapter = _make_adapter(bot_username="server_doctor_5000_bot")
+
+    text = "/task@server_doctor_5000_bot correlation_id=hermes-mm-update-by-sd-20260613"
+
+    assert adapter._clean_bot_trigger_text(text) == "/task correlation_id=hermes-mm-update-by-sd-20260613"
+
+
+def test_plain_mention_still_strips_separator_when_cleaned():
+    adapter = _make_adapter(bot_username="server_doctor_5000_bot")
+
+    text = "@server_doctor_5000_bot: ping"
+
+    assert adapter._clean_bot_trigger_text(text) == "ping"
+
+
 def test_group_messages_can_be_opened_via_config():
     adapter = _make_adapter(require_mention=False)
 

@@ -8437,6 +8437,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Check for commands
         command = event.get_command()
 
+        # Bot-to-bot handoff envelopes are written in Telegram's addressed
+        # slash form (``/task@server_doctor_5000_bot correlation_id=...``) so
+        # Telegram can route them to the target bot in a multi-bot group.
+        # They are not gateway control commands.  Rewrite them back to plain
+        # agent-visible envelopes before the generic unknown-slash guard runs.
+        if command and command.replace("_", "-") in {"task", "ack", "result", "blocked", "done", "ready-for-update"}:
+            args = event.get_command_args().strip()
+            event.text = f"{command.replace('-', '_').upper()} {args}".strip()
+            command = None
+
         from hermes_cli.commands import (
             GATEWAY_KNOWN_COMMANDS,
             is_gateway_known_command,

@@ -5951,7 +5951,15 @@ class TelegramAdapter(BasePlatformAdapter):
         if not text or not self._bot or not getattr(self._bot, "username", None):
             return text
         username = re.escape(self._bot.username)
-        cleaned = re.sub(rf"(?i)@{username}\b[,:\-]*\s*", "", text).strip()
+
+        # Telegram group commands are addressed as ``/cmd@botname args`` and
+        # arrive as a single bot_command entity.  Do NOT strip the following
+        # whitespace when removing the @botname suffix: doing so turns
+        # ``/task@bot correlation_id=...`` into ``/taskcorrelation_id=...``
+        # and the gateway slash parser rejects the handoff before the agent can
+        # see it.  Plain text mentions still consume their separator/spacing.
+        cleaned = re.sub(rf"(?i)(^/[^\s@]+)@{username}\b", r"\1", text).strip()
+        cleaned = re.sub(rf"(?i)@{username}\b[,:\-]*\s*", "", cleaned).strip()
         return cleaned or text
 
     def _should_observe_unmentioned_group_message(self, message: Message) -> bool:
