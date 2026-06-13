@@ -3291,6 +3291,98 @@ def _print_loopback_ssh_hint(redirect_uri: str, *, docs_url: str | None = None) 
 # where one app's refresh invalidates the other's session.
 # =============================================================================
 
+def _codex_state_from_pool(
+    auth_store: Dict[str, Any],
+    *,
+    clear_expired_exhausted: bool = True,
+) -> Tuple[Optional[Dict[str, Any]], bool]:
+    """Recover Codex singleton auth from ``credential_pool.openai-codex``.
+
+    Some update/migration paths can leave valid Codex OAuth material only in
+    the credential pool while ``providers.openai-codex.tokens`` is absent. The
+    runtime/status path treats that as "not logged in" even though a refresh
+    token is still present. Build a singleton-compatible state from the first
+    pool entry with both access and refresh tokens, and clear stale
+    ``exhausted`` markers once their reset window has elapsed.
+    """
+    pool = auth_store.get("credential_pool")
+    if not isinstance(pool, dict):
+        return None, False
+    entries = pool.get("openai-codex")
+    if not isinstance(entries, list):
+        return None, False
+
+    changed = False
+    now = time.time()
+    chosen: Optional[Dict[str, Any]] = None
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        if clear_expired_exhausted and entry.get("last_status") == "exhausted":
+            reset_at = entry.get("last_error_reset_at")
+            if not isinstance(reset_at, (int, float)) or reset_at <= now:
+                for key in (
+                    "last_status",
+                    "last_status_at",
+                    "last_error_code",
+                    "last_error_reason",
+                    "last_error_message",
+                    "last_error_reset_at",
+                ):
+                    if entry.get(key) is not None:
+                        entry[key] = None
+                        changed = True
+        access_token = entry.get("access_token")
+        refresh_token = entry.get("refresh_token")
+        if (
+            chosen is None
+            and isinstance(access_token, str)
+            and access_token.strip()
+            and isinstance(refresh_token, str)
+            and refresh_token.strip()
+        ):
+            chosen = entry
+
+    if chosen is None:
+        return None, changed
+
+    state = {
+        "tokens": {
+            "access_token": chosen["access_token"],
+            "refresh_token": chosen["refresh_token"],
+        },
+        "last_refresh": chosen.get("last_refresh"),
+        "auth_mode": "chatgpt",
+        "source": "credential_pool",
+    }
+    label = chosen.get("label")
+    if isinstance(label, str) and label.strip():
+        state["label"] = label.strip()
+    return state, changed
+
+
+def _codex_state_from_global_store() -> Tuple[Optional[Dict[str, Any]], Optional[List[Dict[str, Any]]]]:
+    """Return Codex auth from the global root when a profile lacks it locally."""
+    global_store = _load_global_auth_store()
+    if not global_store:
+        return None, None
+    state = _load_provider_state(global_store, "openai-codex")
+    if isinstance(state, dict):
+        tokens = state.get("tokens")
+        if (
+            isinstance(tokens, dict)
+            and isinstance(tokens.get("access_token"), str)
+            and tokens.get("access_token", "").strip()
+            and isinstance(tokens.get("refresh_token"), str)
+            and tokens.get("refresh_token", "").strip()
+        ):
+            entries = (global_store.get("credential_pool") or {}).get("openai-codex")
+            return state, entries if isinstance(entries, list) else None
+    state, _ = _codex_state_from_pool(global_store, clear_expired_exhausted=False)
+    entries = (global_store.get("credential_pool") or {}).get("openai-codex")
+    return state, entries if isinstance(entries, list) else None
+
+
 def _read_codex_tokens(*, _lock: bool = True) -> Dict[str, Any]:
     """Read Codex OAuth tokens from Hermes auth store (~/.hermes/auth.json).
     
@@ -3303,21 +3395,53 @@ def _read_codex_tokens(*, _lock: bool = True) -> Dict[str, Any]:
     else:
         auth_store = _load_auth_store()
     state = _load_provider_state(auth_store, "openai-codex")
+    recovered_state = None
+    pool_changed = False
     if not state:
-        raise AuthError(
-            "No Codex credentials stored. Run `hermes auth` to authenticate.",
-            provider="openai-codex",
-            code="codex_auth_missing",
-            relogin_required=True,
-        )
+        recovered_state, pool_changed = _codex_state_from_pool(auth_store)
+        if recovered_state is None:
+            recovered_state, global_entries = _codex_state_from_global_store()
+            if recovered_state is not None:
+                pool = auth_store.get("credential_pool")
+                if not isinstance(pool, dict):
+                    pool = {}
+                    auth_store["credential_pool"] = pool
+                if global_entries is not None and not isinstance(pool.get("openai-codex"), list):
+                    pool["openai-codex"] = global_entries
+                state = recovered_state
+                _save_provider_state(auth_store, "openai-codex", state)
+                _save_auth_store(auth_store)
+            else:
+                if pool_changed:
+                    _save_auth_store(auth_store)
+                raise AuthError(
+                    "No Codex credentials stored. Run `hermes auth` to authenticate.",
+                    provider="openai-codex",
+                    code="codex_auth_missing",
+                    relogin_required=True,
+                )
+        else:
+            state = recovered_state
+            _save_provider_state(auth_store, "openai-codex", state)
+            _save_auth_store(auth_store)
+    else:
+        recovered_state, pool_changed = _codex_state_from_pool(auth_store)
+        if pool_changed:
+            _save_auth_store(auth_store)
     tokens = state.get("tokens")
     if not isinstance(tokens, dict):
-        raise AuthError(
-            "Codex auth state is missing tokens. Run `hermes auth` to re-authenticate.",
-            provider="openai-codex",
-            code="codex_auth_invalid_shape",
-            relogin_required=True,
-        )
+        recovered_state, _ = _codex_state_from_pool(auth_store)
+        if recovered_state is None:
+            raise AuthError(
+                "Codex auth state is missing tokens. Run `hermes auth` to re-authenticate.",
+                provider="openai-codex",
+                code="codex_auth_invalid_shape",
+                relogin_required=True,
+            )
+        state = recovered_state
+        tokens = state.get("tokens")
+        _save_provider_state(auth_store, "openai-codex", state)
+        _save_auth_store(auth_store)
     access_token = tokens.get("access_token")
     refresh_token = tokens.get("refresh_token")
     if not isinstance(access_token, str) or not access_token.strip():
@@ -3337,6 +3461,7 @@ def _read_codex_tokens(*, _lock: bool = True) -> Dict[str, Any]:
     return {
         "tokens": tokens,
         "last_refresh": state.get("last_refresh"),
+        "source": state.get("source"),
     }
 
 
@@ -3801,7 +3926,7 @@ def resolve_codex_runtime_credentials(
         "provider": "openai-codex",
         "base_url": base_url,
         "api_key": access_token,
-        "source": "hermes-auth-store",
+        "source": data.get("source") or "hermes-auth-store",
         "last_refresh": data.get("last_refresh"),
         "auth_mode": "chatgpt",
     }
