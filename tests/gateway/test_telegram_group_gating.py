@@ -14,6 +14,7 @@ def _make_adapter(
     free_response_topics=None,
     mention_patterns=None,
     exclusive_bot_mentions=None,
+    ignored_reply_to_bot_usernames=None,
     ignored_threads=None,
     allowed_topics=None,
     allow_from=None,
@@ -37,6 +38,8 @@ def _make_adapter(
         extra["mention_patterns"] = mention_patterns
     if exclusive_bot_mentions is not None:
         extra["exclusive_bot_mentions"] = exclusive_bot_mentions
+    if ignored_reply_to_bot_usernames is not None:
+        extra["ignored_reply_to_bot_usernames"] = ignored_reply_to_bot_usernames
     if ignored_threads is not None:
         extra["ignored_threads"] = ignored_threads
     if allowed_topics is not None:
@@ -96,13 +99,18 @@ def _group_message(
     from_user_name="Alice Example",
     thread_id=None,
     reply_to_bot=False,
+    reply_to_bot_username=None,
     entities=None,
     caption=None,
     caption_entities=None,
 ):
     reply_to_message = None
-    if reply_to_bot:
-        reply_to_message = SimpleNamespace(from_user=SimpleNamespace(id=999), message_id=10, text="previous bot reply", caption=None)
+    if reply_to_bot or reply_to_bot_username:
+        reply_user = SimpleNamespace(
+            id=999 if reply_to_bot else 123456,
+            username=reply_to_bot_username or "hermes_bot",
+        )
+        reply_to_message = SimpleNamespace(from_user=reply_user, message_id=10, text="previous bot reply", caption=None)
     return SimpleNamespace(
         message_id=42,
         text=text,
@@ -555,6 +563,23 @@ def test_free_response_topics_bypass_mention_requirement_without_opening_whole_c
 
     assert adapter._should_process_message(_group_message("hello", chat_id=-100, thread_id=259)) is True
     assert adapter._should_process_message(_group_message("hello", chat_id=-100, thread_id=1346)) is False
+
+
+def test_ignored_reply_to_bot_username_wins_over_free_response_topic():
+    adapter = _make_adapter(
+        require_mention=True,
+        allowed_chats=["-100"],
+        free_response_topics=[{"chat_id": "-100", "thread_id": "1346"}],
+        ignored_reply_to_bot_usernames=["@ceo5000_bot"],
+        bot_username="server_doctor_5000_bot",
+    )
+
+    assert adapter._should_process_message(
+        _group_message("doctor should stay silent", chat_id=-100, thread_id=1346, reply_to_bot_username="ceo5000_bot")
+    ) is False
+    assert adapter._should_process_message(
+        _group_message("doctor can answer own replies", chat_id=-100, thread_id=1346, reply_to_bot=True)
+    ) is True
 
 
 def test_free_response_topics_accept_string_entries_and_general_topic():

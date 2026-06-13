@@ -5569,6 +5569,24 @@ class TelegramAdapter(BasePlatformAdapter):
             return bool(configured)
         return os.getenv("TELEGRAM_EXCLUSIVE_BOT_MENTIONS", "true").lower() in {"true", "1", "yes", "on"}
 
+    def _telegram_ignored_reply_to_bot_usernames(self) -> set[str]:
+        raw = self.config.extra.get("ignored_reply_to_bot_usernames")
+        if raw is None:
+            raw = os.getenv("TELEGRAM_IGNORED_REPLY_TO_BOT_USERNAMES", "")
+        if isinstance(raw, list):
+            values = raw
+        else:
+            values = str(raw).split(",")
+        return {str(part).strip().lstrip("@").lower() for part in values if str(part).strip()}
+
+    def _is_reply_to_ignored_bot_username(self, message: Message) -> bool:
+        ignored = self._telegram_ignored_reply_to_bot_usernames()
+        if not ignored or not getattr(message, "reply_to_message", None):
+            return False
+        reply_user = getattr(message.reply_to_message, "from_user", None)
+        username = (getattr(reply_user, "username", None) or "").lstrip("@").lower()
+        return bool(username and username in ignored)
+
     def _telegram_free_response_chats(self) -> set[str]:
         raw = self.config.extra.get("free_response_chats")
         if raw is None:
@@ -5945,6 +5963,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 return False
 
         chat_id_str = str(getattr(getattr(message, "chat", None), "id", ""))
+        if self._is_reply_to_ignored_bot_username(message):
+            return False
         if self._telegram_exclusive_bot_mentions() and self._explicit_bot_mentions_exclude_self(message):
             return False
 
@@ -6268,6 +6288,8 @@ class TelegramAdapter(BasePlatformAdapter):
 
         chat_id_str = str(getattr(getattr(message, "chat", None), "id", ""))
 
+        if self._is_reply_to_ignored_bot_username(message):
+            return False
         if self._telegram_exclusive_bot_mentions() and self._explicit_bot_mentions_exclude_self(message):
             return False
 
