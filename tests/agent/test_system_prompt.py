@@ -99,3 +99,17 @@ class TestCodingContextBlock:
         monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
         agent = _make_agent(valid_tool_names=[], platform="cli")
         assert "coding agent" not in _stable_prompt(agent)
+
+
+class TestUntrustedContentGuidance:
+    def test_injected_when_tools_available(self):
+        agent = _make_agent(valid_tool_names=["web_search"], platform="cli")
+        stable = _stable_prompt(agent)
+        assert "Untrusted web/GitHub/tool content" in stable
+        assert "GitHub issues/PRs/README" in stable
+        assert "reveal secrets" in stable
+
+    def test_absent_without_tools(self):
+        agent = _make_agent(valid_tool_names=[], platform="cli")
+        stable = _stable_prompt(agent)
+        assert "Untrusted web/GitHub/tool content" not in stable

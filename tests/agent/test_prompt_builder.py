@@ -32,6 +32,7 @@ from agent.prompt_builder import (
     MEMORY_GUIDANCE,
     SESSION_SEARCH_GUIDANCE,
     PLATFORM_HINTS,
+    UNTRUSTED_CONTENT_GUIDANCE,
     WSL_ENVIRONMENT_HINT,
 )
 from hermes_cli.nous_subscription import NousFeatureState, NousSubscriptionFeatures
@@ -53,6 +54,14 @@ class TestGuidanceConstants:
     def test_session_search_guidance_is_simple_cross_session_recall(self):
         assert "relevant cross-session context exists" in SESSION_SEARCH_GUIDANCE
         assert "recent turns of the current session" not in SESSION_SEARCH_GUIDANCE
+
+
+    def test_untrusted_content_guidance_covers_web_github_and_tool_output(self):
+        assert "web pages" in UNTRUSTED_CONTENT_GUIDANCE
+        assert "GitHub issues/PRs/README" in UNTRUSTED_CONTENT_GUIDANCE
+        assert "tool output" in UNTRUSTED_CONTENT_GUIDANCE
+        assert "reveal secrets" in UNTRUSTED_CONTENT_GUIDANCE
+        assert "verify the action independently" in UNTRUSTED_CONTENT_GUIDANCE
 
 
 # =========================================================================
