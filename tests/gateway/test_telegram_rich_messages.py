@@ -126,6 +126,22 @@ async def test_rich_happy_path_sends_raw_markdown():
 
 
 @pytest.mark.asyncio
+async def test_rich_send_normalizes_spacing_without_breaking_tables():
+    adapter = _make_adapter()
+    noisy = "\n" + RICH_CONTENT.replace("## Results", "## Results   ") + "   \n\n\n"
+
+    result = await adapter.send("12345", noisy)
+
+    assert result.success is True
+    api_kwargs = _rich_api_kwargs(adapter)
+    rich_markdown = api_kwargs["rich_message"]["markdown"]
+    assert rich_markdown.startswith("## Results\n\n| Case | Status |")
+    assert "| rich | ✅ |" in rich_markdown
+    assert "- [x] table renders" in rich_markdown
+    assert not rich_markdown.endswith("\n")
+
+
+@pytest.mark.asyncio
 async def test_details_with_math_skips_rich_send_to_avoid_tdesktop_crash():
     adapter = _make_adapter()
 

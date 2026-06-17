@@ -215,6 +215,54 @@ def _separate_chunk_indicator_from_fence(text: str) -> str:
     return _CHUNK_INDICATOR_ON_FENCE_RE.sub(r'```\n\g<indicator>', text)
 
 
+def _normalize_telegram_message_spacing(content: Any) -> Any:
+    """Apply conservative Telegram-facing whitespace hygiene.
+
+    This is intentionally small and syntax-preserving: trim message-edge blank
+    space, remove trailing whitespace outside fenced code blocks, and collapse
+    excessive blank runs outside code.  It runs before rich/Markdown/plain
+    delivery so the visible final text is consistent across send and final edit
+    paths without changing routing or prompts.
+    """
+    if not isinstance(content, str) or not content:
+        return content
+
+    text = content.strip("\n")
+    if not text:
+        return text
+
+    lines = text.split("\n")
+    normalized: list[str] = []
+    in_fence = False
+    blank_run = 0
+
+    for line in lines:
+        fence_line = line.lstrip().startswith("```")
+        if in_fence:
+            normalized.append(line)
+            if fence_line:
+                in_fence = False
+            continue
+
+        if fence_line:
+            normalized.append(line.rstrip())
+            in_fence = True
+            blank_run = 0
+            continue
+
+        cleaned = line.rstrip()
+        if cleaned == "":
+            blank_run += 1
+            if blank_run <= 2:
+                normalized.append("")
+            continue
+
+        blank_run = 0
+        normalized.append(cleaned)
+
+    return "\n".join(normalized).strip("\n")
+
+
 # ---------------------------------------------------------------------------
 # Markdown table → Telegram-friendly row groups
 # ---------------------------------------------------------------------------
@@ -2617,6 +2665,7 @@ class TelegramAdapter(BasePlatformAdapter):
         # Skip whitespace-only text to prevent Telegram 400 empty-text errors.
         if not content or not content.strip():
             return SendResult(success=True, message_id=None)
+        content = _normalize_telegram_message_spacing(content)
         
         try:
             # Bot API 10.1 rich fast-path: send the raw agent markdown via
@@ -2985,6 +3034,8 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not self._bot:
             return SendResult(success=False, error="Not connected")
+        if content:
+            content = _normalize_telegram_message_spacing(content)
 
         # Rich finalize (Bot API 10.1): when the completed content has
         # constructs the legacy MarkdownV2 edit degrades (tables → bullet
@@ -3420,6 +3471,7 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not self._bot:
             return SendResult(success=False, error="not_connected")
+        content = _normalize_telegram_message_spacing(content)
 
         # Rich draft fast-path (Bot API 10.1 sendRichMessageDraft): render the
         # streaming preview with the same raw markdown the final

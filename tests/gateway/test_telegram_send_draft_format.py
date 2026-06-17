@@ -65,6 +65,21 @@ async def test_send_draft_passes_markdownv2_parse_mode():
 
 
 @pytest.mark.asyncio
+async def test_send_draft_normalizes_spacing_before_markdownv2():
+    adapter = _make_adapter()
+    adapter.format_message = lambda content: f"FMT::{content}"
+
+    result = await adapter.send_draft("123", 7, "\n**bold** body   \n\n\nnext   \n")
+
+    assert result.success is True
+    bot = adapter._bot
+    assert bot is not None
+    kwargs = bot.send_message_draft.await_args.kwargs
+    assert kwargs["text"] == "FMT::**bold** body\n\n\nnext"
+    assert kwargs["parse_mode"] is tg_mod.ParseMode.MARKDOWN_V2
+
+
+@pytest.mark.asyncio
 async def test_send_draft_falls_back_to_plain_text_on_markdownv2_error():
     """A MarkdownV2 BadRequest retries once as plain text (no parse_mode),
     instead of aborting draft streaming for the whole response."""

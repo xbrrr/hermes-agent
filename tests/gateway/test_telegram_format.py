@@ -38,6 +38,7 @@ _ensure_telegram_mock()
 from plugins.platforms.telegram.adapter import (  # noqa: E402
     TelegramAdapter,
     _escape_mdv2,
+    _normalize_telegram_message_spacing,
     _strip_mdv2,
     _wrap_markdown_tables,
 )
@@ -51,6 +52,34 @@ from plugins.platforms.telegram.adapter import (  # noqa: E402
 def adapter():
     config = PlatformConfig(enabled=True, token="fake-token")
     return TelegramAdapter(config)
+
+
+# =========================================================================
+# Telegram-facing spacing normalization
+# =========================================================================
+
+
+class TestTelegramSpacingNormalization:
+    def test_trims_edges_trailing_space_and_excess_blank_runs(self):
+        raw = "\n\nИтог: ok   \n\n\n\nСледующий шаг: тест   \n\n"
+
+        assert _normalize_telegram_message_spacing(raw) == (
+            "Итог: ok\n\n\nСледующий шаг: тест"
+        )
+
+    def test_preserves_fenced_code_block_content(self):
+        raw = "Before   \n```\nline with intentional spaces   \n\n```\nAfter   "
+
+        assert _normalize_telegram_message_spacing(raw) == (
+            "Before\n```\nline with intentional spaces   \n\n```\nAfter"
+        )
+
+    def test_preserves_tables_and_task_lists(self):
+        raw = "| Case | Status |   \n|---|---|\n| rich | ✅ |\n\n- [x] table renders   "
+
+        assert _normalize_telegram_message_spacing(raw) == (
+            "| Case | Status |\n|---|---|\n| rich | ✅ |\n\n- [x] table renders"
+        )
 
 
 # =========================================================================
@@ -867,6 +896,32 @@ async def test_send_escapes_chunk_indicator_for_markdownv2(adapter):
 
 
 # =========================================================================
+# send — final Telegram spacing safety
+# =========================================================================
+
+
+@pytest.mark.asyncio
+async def test_send_normalizes_spacing_before_legacy_markdownv2():
+    adapter = TelegramAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="fake-token",
+            extra={"rich_messages": False},
+        )
+    )
+    bot = MagicMock()
+    bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=1))
+    bot.send_chat_action = AsyncMock()
+    adapter._bot = bot
+
+    result = await adapter.send("123", "\nHello **world**   \n\n\nnext   \n")
+
+    assert result.success is True
+    sent = bot.send_message.await_args.kwargs
+    assert sent["text"] == "Hello *world*\n\n\nnext"
+
+
+# =========================================================================
 # edit_message — streaming Markdown safety
 # =========================================================================
 
@@ -905,6 +960,25 @@ class TestEditMessageStreamingSafety:
             "message_id": 456,
             "text": "final bold",
         }
+
+    @pytest.mark.asyncio
+    async def test_final_edit_normalizes_spacing_before_markdownv2(self):
+        adapter = TelegramAdapter(PlatformConfig(enabled=True, token="fake-token"))
+        adapter._bot = MagicMock()
+        adapter._bot.edit_message_text = AsyncMock()
+
+        result = await adapter.edit_message(
+            "123",
+            "456",
+            "\nfinal **bold**   \n\n\nnext   \n",
+            finalize=True,
+        )
+
+        assert result.success is True
+        bot = adapter._bot
+        assert bot is not None
+        call = bot.edit_message_text.await_args.kwargs
+        assert call["text"] == "final *bold*\n\n\nnext"
 
     @pytest.mark.asyncio
     async def test_message_too_long_splits_into_continuations_not_silent_truncation(self):
