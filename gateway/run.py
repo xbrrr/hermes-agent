@@ -4822,30 +4822,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 pass
 
-        status_detail = f" ({', '.join(status_parts)})" if status_parts else ""
+        from gateway.control_cards import format_busy_ack_card
+
         if is_steer_mode:
-            message = (
-                f"⏩ Steered into current run{status_detail}. "
-                f"Your message arrives after the next tool call."
-            )
-        elif is_queue_mode and demoted_for_subagents:
-            # #30170 — explain the demotion so the user knows their
-            # follow-up didn't accidentally kill the subagent and
-            # discovers `/stop` as the explicit escape hatch.
-            message = (
-                f"⏳ Subagent working{status_detail} — your message is queued for "
-                f"when it finishes (use /stop to cancel everything)."
-            )
+            message = format_busy_ack_card(mode="steer", details=status_parts)
         elif is_queue_mode:
-            message = (
-                f"⏳ Queued for the next turn{status_detail}. "
-                f"I'll respond once the current task finishes."
+            message = format_busy_ack_card(
+                mode="queue",
+                details=status_parts,
+                demoted_for_subagents=demoted_for_subagents,
             )
         else:
-            message = (
-                f"⚡ Interrupting current task{status_detail}. "
-                f"I'll respond to your message shortly."
-            )
+            message = format_busy_ack_card(mode="interrupt", details=status_parts)
 
         # First-touch onboarding: the very first time a user sends a message
         # while the agent is busy, append a one-time hint explaining the
@@ -17230,6 +17218,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # who want it can opt in per platform.
                 _agent_ref = agent_holder[0]
                 _status_detail = ""
+                _parts = []
                 _want_iteration_detail = bool(
                     resolve_display_setting(
                         user_config,
@@ -17241,7 +17230,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _agent_ref and hasattr(_agent_ref, "get_activity_summary"):
                     try:
                         _a = _agent_ref.get_activity_summary()
-                        _parts = []
                         if _want_iteration_detail:
                             _parts.append(
                                 f"iteration {_a['api_call_count']}/{_a['max_iterations']}"
@@ -17253,7 +17241,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             _status_detail = " — " + ", ".join(_parts)
                     except Exception:
                         pass
-                _heartbeat_text = f"⏳ Working — {_elapsed_mins} min{_status_detail}"
+                from gateway.control_cards import format_stall_notice_card
+
+                _heartbeat_text = format_stall_notice_card(
+                    elapsed_minutes=_elapsed_mins,
+                    details=_parts,
+                )
                 try:
                     _notify_res = None
                     if _heartbeat_msg_id:
