@@ -67,6 +67,11 @@ _AGENT_CACHE_MAX_SIZE = 128
 _AGENT_CACHE_IDLE_TTL_SECS = 3600.0  # evict agents idle for >1h
 _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
+# Telegram flood-control retries can legitimately sleep for 30–40s.  The
+# gateway must wait for the stream consumer's final delivery path long enough
+# before falling back to the normal final send; otherwise both paths can post
+# the same final answer in forum topics.
+_STREAM_FINAL_DELIVERY_WAIT_SECS = 45.0
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
@@ -15028,7 +15033,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _stream_consumer.finish()
             if stream_task:
                 try:
-                    await asyncio.wait_for(stream_task, timeout=5.0)
+                    await asyncio.wait_for(stream_task, timeout=_STREAM_FINAL_DELIVERY_WAIT_SECS)
                 except (asyncio.TimeoutError, asyncio.CancelledError):
                     stream_task.cancel()
 
@@ -17617,7 +17622,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _sc = stream_consumer_holder[0]
                     if _sc and stream_task:
                         try:
-                            await asyncio.wait_for(stream_task, timeout=5.0)
+                            await asyncio.wait_for(stream_task, timeout=_STREAM_FINAL_DELIVERY_WAIT_SECS)
                         except (asyncio.TimeoutError, asyncio.CancelledError):
                             stream_task.cancel()
                             try:
@@ -17756,7 +17761,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         pass
                 else:
                     try:
-                        await asyncio.wait_for(stream_task, timeout=5.0)
+                        await asyncio.wait_for(stream_task, timeout=_STREAM_FINAL_DELIVERY_WAIT_SECS)
                     except (asyncio.TimeoutError, asyncio.CancelledError):
                         stream_task.cancel()
                         try:
