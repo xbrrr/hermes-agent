@@ -12,6 +12,7 @@ def _make_adapter(
     require_mention=None,
     free_response_chats=None,
     free_response_topics=None,
+    free_response_excluded_topics=None,
     mention_patterns=None,
     exclusive_bot_mentions=None,
     ignored_reply_to_bot_usernames=None,
@@ -34,6 +35,8 @@ def _make_adapter(
         extra["free_response_chats"] = free_response_chats
     if free_response_topics is not None:
         extra["free_response_topics"] = free_response_topics
+    if free_response_excluded_topics is not None:
+        extra["free_response_excluded_topics"] = free_response_excluded_topics
     if mention_patterns is not None:
         extra["mention_patterns"] = mention_patterns
     if exclusive_bot_mentions is not None:
@@ -608,6 +611,27 @@ def test_free_response_topics_accept_string_entries_and_general_topic():
     assert adapter._should_process_message(_group_message("hello", chat_id=-100, thread_id=None)) is True
     assert adapter._should_process_message(_group_message("hello", chat_id=-200, thread_id=7)) is True
     assert adapter._should_process_message(_group_message("hello", chat_id=-200, thread_id=8)) is False
+
+
+def test_free_response_topics_accept_wildcard_with_exclusions_for_future_topics():
+    adapter = _make_adapter(
+        require_mention=True,
+        allowed_chats=["-100"],
+        free_response_topics=[{"chat_id": "-100", "thread_id": "*"}],
+        free_response_excluded_topics=[{"chat_id": "-100", "thread_id": "1346"}],
+    )
+
+    assert adapter._should_process_message(_group_message("new topic", chat_id=-100, thread_id=9999)) is True
+    assert adapter._should_process_message(_group_message("server doctor stays isolated", chat_id=-100, thread_id=1346)) is False
+    assert adapter._should_process_message(
+        _group_message(
+            "explicit MM mention still works in Server-doctor @hermes_bot",
+            chat_id=-100,
+            thread_id=1346,
+            entities=[_mention_entity("explicit MM mention still works in Server-doctor @hermes_bot")],
+        )
+    ) is True
+    assert adapter._should_process_message(_group_message("other chat", chat_id=-101, thread_id=9999)) is False
 
 
 def test_guest_mode_allows_only_direct_mentions_outside_allowed_chats():
