@@ -3320,18 +3320,23 @@ def _codex_state_from_pool(
             continue
         if clear_expired_exhausted and entry.get("last_status") == "exhausted":
             reset_at = entry.get("last_error_reset_at")
-            if not isinstance(reset_at, (int, float)) or reset_at <= now:
-                for key in (
-                    "last_status",
-                    "last_status_at",
-                    "last_error_code",
-                    "last_error_reason",
-                    "last_error_message",
-                    "last_error_reset_at",
-                ):
-                    if entry.get(key) is not None:
-                        entry[key] = None
-                        changed = True
+            if isinstance(reset_at, (int, float)) and reset_at > now:
+                # A credential in an active exhaustion window is still valid
+                # auth, but must not be selected as usable runtime credentials.
+                # Let the resolver surface codex_rate_limited instead of
+                # silently returning a token that will immediately 429.
+                continue
+            for key in (
+                "last_status",
+                "last_status_at",
+                "last_error_code",
+                "last_error_reason",
+                "last_error_message",
+                "last_error_reset_at",
+            ):
+                if entry.get(key) is not None:
+                    entry[key] = None
+                    changed = True
         access_token = entry.get("access_token")
         refresh_token = entry.get("refresh_token")
         if (
